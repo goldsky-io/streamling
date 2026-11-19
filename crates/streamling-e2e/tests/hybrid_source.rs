@@ -2352,7 +2352,9 @@ sinks:
         kafka_topic = ctx.kafka_topic,
     );
 
-    let status = ctx
+    // The harness maps a nonzero streamling exit to Err, which is the
+    // expected loud failure here; an Ok status must still be non-success.
+    match ctx
         .run_pipeline_with_opts(
             &pipeline,
             PipelineOpts::new()
@@ -2360,13 +2362,14 @@ sinks:
                 .timeout(std::time::Duration::from_secs(120)),
         )
         .await
-        .expect("Streamling execution failed");
-
-    assert!(
-        !status.success(),
-        "Pipeline must fail loudly when a target field is backed by a MATERIALIZED ClickHouse \
-         column, instead of null-filling data that exists"
-    );
+    {
+        Err(_) => {}
+        Ok(status) => assert!(
+            !status.success(),
+            "Pipeline must fail loudly when a target field is backed by a MATERIALIZED ClickHouse \
+             column, instead of null-filling data that exists"
+        ),
+    }
 
     // No silent backfill happened: the sink table never receives rows.
     let written = ctx
