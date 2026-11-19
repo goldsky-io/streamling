@@ -420,6 +420,15 @@ sinks:
         "with no filter, the hybrid node's input equals its output"
     );
     assert!(delta("streamling_input_bytes_delta", "hybrid_source") > 0);
+    // The phase ids are real nodes: they report their own output rows.
+    let bounded = delta("streamling_output_rows_delta", "hybrid_source_bounded_0");
+    let unbounded = delta("streamling_output_rows_delta", "hybrid_source_unbounded");
+    assert_eq!(bounded, 3, "the ClickHouse phase emits its 3 rows");
+    assert_eq!(
+        bounded + unbounded,
+        hybrid_input,
+        "the phases emit what the hybrid node pulled in"
+    );
     for phase in ["hybrid_source_bounded_0", "hybrid_source_unbounded"] {
         for metric in [
             "streamling_input_rows_delta",
@@ -488,12 +497,11 @@ sinks:
     let status = ctx
         .run_pipeline_with_opts(
             pipeline,
+            // The bounded scan ends the run on its own.
             opts_with(
                 &capture,
                 &ctx.test_id,
-                PipelineOpts::new()
-                    .record_limit(5)
-                    .timeout(Duration::from_secs(60)),
+                PipelineOpts::new().timeout(Duration::from_secs(60)),
             ),
         )
         .await

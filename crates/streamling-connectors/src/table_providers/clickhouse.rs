@@ -2011,12 +2011,6 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             continue;
                         }
 
-                        // Only an emitted page counts what it pulled in: an overflowed page
-                        // is re-read, and that read counts instead. Rows count before the
-                        // version dedup below, so the source's wrapper does not count them.
-                        metrics_recorder.record_count("input_bytes_delta", wire_bytes as u64, &metric_metadata_id);
-                        metrics_recorder.record_input_rows_count(total_rows_in_page as u64, &metric_metadata_id);
-
                         // Complete page. Emit all buffered batches, emitting one empty
                         // batch for an empty scan so buffered checkpoint messages flow.
                         let mut receiver_dropped = false;
@@ -2123,6 +2117,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             warn!("ClickHouseSourceExec: receiver dropped during page {}", page_count);
                             break;
                         }
+
+                        // Only a fully emitted page counts what it pulled in: an overflowed or
+                        // abandoned page is re-read, and that read counts instead. Rows count
+                        // before the version dedup above, so the source's wrapper does not.
+                        metrics_recorder.record_count("input_bytes_delta", wire_bytes as u64, &metric_metadata_id);
+                        metrics_recorder.record_input_rows_count(total_rows_in_page as u64, &metric_metadata_id);
 
                         // Completed range: advance the cursor and persist it. on_complete
                         // moves range_start past this range; the while condition (is_done)

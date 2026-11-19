@@ -1435,7 +1435,7 @@ mod tests {
     /// filter still drops rows above it. The row metrics are covered in
     /// `recorder::pipeline_io_delta_tests`.
     #[tokio::test]
-    async fn test_source_wrapper_counts_rows_before_source_filter() {
+    async fn test_side_outputs_see_rows_before_source_filter() {
         let schema = test_schema();
         let batch = RecordBatch::try_new(
             schema.clone(),
