@@ -1813,3 +1813,222 @@ sinks:
         by_id.get("null")
     );
 }
+
+// ============================================================================
+// Scenario: rows archived during the bounded scan must survive the handoff
+// ============================================================================
+
+/// BDA-3880: the ClickHouse scan reads `max(block)` once at start, and the
+/// archive keeps ingesting from Kafka while the scan runs. Rows archived in
+/// that window sit above the scan's upper bound, so only Kafka can deliver
+/// them: Kafka must resume from the archive's position at scan start, not from
+/// its position at the handoff.
+#[tokio::test]
+async fn test_hybrid_handoff_delivers_rows_archived_during_bounded_scan() {
+    init_tracing();
+
+    const ARCHIVE_ROWS: i64 = 2000;
+    const LATE_ROWS: i64 = 5;
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_handoff_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                is_deleted UInt8
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    let archive_values: Vec<String> = (1..=ARCHIVE_ROWS)
+        .map(|i| format!("({i}, 'archive_{i}', 'data_{i}', {i}, 0)"))
+        .collect();
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO hybrid_handoff_test VALUES {}",
+            archive_values.join(",")
+        ))
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    // Kafka offsets 0..LATE_ROWS: on the topic before the pipeline starts, not
+    // yet archived.
+    let late_records: Vec<TestRecord> = (1..=LATE_ROWS)
+        .map(|i| TestRecord {
+            block: ARCHIVE_ROWS + i,
+            id: format!("late_{i}"),
+            data: format!("late_data_{i}"),
+            timestamp: ARCHIVE_ROWS + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&late_records)
+        .await
+        .expect("Failed to produce late Kafka records");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_handoff (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+    clickhouse
+        .execute(&format!(
+            "INSERT INTO kafka_offsets_handoff VALUES ('{}', 0, 0)",
+            ctx.kafka_topic
+        ))
+        .await
+        .expect("Failed to insert initial archive offset");
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_handoff_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_handoff
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: hybrid_handoff_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    // One-row pages make the scan last thousands of ClickHouse round trips, so
+    // the archive writes below land while it is in progress.
+    let run_pipeline = ctx.run_pipeline_with_opts(
+        &pipeline,
+        PipelineOpts::new()
+            // Either the late rows (correct) or the tail rows (regression)
+            // complete the count, so the pipeline stops in both cases and the
+            // assertion below decides.
+            .record_limit((ARCHIVE_ROWS + LATE_ROWS) as u64)
+            .timeout(std::time::Duration::from_secs(300))
+            .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+            .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "1")
+            .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "1"),
+    );
+
+    let archive_late_rows = async {
+        let sink_count = || async {
+            ctx.postgres
+                .count("SELECT COUNT(*) FROM public.hybrid_handoff_results")
+                .await
+                .unwrap_or(0)
+        };
+
+        // A sink row proves the scan already fixed its upper bound.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while sink_count().await == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "bounded scan produced no sink rows within 120s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // The archive catches up with Kafka: the late rows and its new position.
+        let late_values: Vec<String> = (1..=LATE_ROWS)
+            .map(|i| {
+                let block = ARCHIVE_ROWS + i;
+                format!("({block}, 'late_{i}', 'late_data_{i}', {block}, 0)")
+            })
+            .collect();
+        clickhouse
+            .execute(&format!(
+                "INSERT INTO hybrid_handoff_test VALUES {}",
+                late_values.join(",")
+            ))
+            .await
+            .expect("Failed to archive late rows");
+        clickhouse
+            .execute(&format!(
+                "INSERT INTO kafka_offsets_handoff VALUES ('{}', 0, {})",
+                ctx.kafka_topic, LATE_ROWS
+            ))
+            .await
+            .expect("Failed to advance archive offset");
+
+        let scanned = sink_count().await;
+        assert!(
+            scanned < ARCHIVE_ROWS / 2,
+            "archive writes must land while the bounded scan is in progress; \
+             sink already holds {scanned} of {ARCHIVE_ROWS} rows"
+        );
+
+        let tail_records: Vec<TestRecord> = (1..=LATE_ROWS)
+            .map(|i| TestRecord {
+                block: ARCHIVE_ROWS + LATE_ROWS + i,
+                id: format!("tail_{i}"),
+                data: format!("tail_data_{i}"),
+                timestamp: ARCHIVE_ROWS + LATE_ROWS + i,
+            })
+            .collect();
+        ctx.kafka
+            .produce_avro_records(&tail_records)
+            .await
+            .expect("Failed to produce tail Kafka records");
+    };
+
+    let (status, ()) = tokio::join!(run_pipeline, archive_late_rows);
+    assert!(
+        status.expect("Streamling execution failed").success(),
+        "Streamling should exit successfully"
+    );
+
+    let archive_count = ctx
+        .postgres
+        .count("SELECT COUNT(*) FROM public.hybrid_handoff_results WHERE id LIKE 'archive_%'")
+        .await
+        .expect("Failed to query archive count");
+    assert_eq!(archive_count, ARCHIVE_ROWS, "bounded phase rows missing");
+
+    let late_ids: Vec<(String,)> = ctx
+        .postgres
+        .query("SELECT id FROM public.hybrid_handoff_results WHERE id LIKE 'late_%' ORDER BY id")
+        .await
+        .expect("Failed to query late rows");
+    assert_eq!(
+        late_ids.len() as i64,
+        LATE_ROWS,
+        "rows archived during the bounded scan were skipped at the handoff; delivered: {late_ids:?}"
+    );
+}
