@@ -328,7 +328,13 @@ mod tests {
     /// waker: no recording waker, so no lock on any poll or wake.
     #[test]
     fn an_untimed_input_is_polled_with_the_tasks_own_waker() {
-        let task = Waker::noop();
+        struct Task(std::sync::atomic::AtomicBool);
+        impl Wake for Task {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let task = &Waker::from(Arc::new(Task(Default::default())));
         let own_waker = Arc::new(Mutex::new(None));
         let seen = Arc::clone(&own_waker);
         let probe = task.clone();
