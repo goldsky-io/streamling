@@ -2020,6 +2020,7 @@ impl ExecutionPlan for KafkaSourceExec {
 
                 let mut row_kinds = Vec::new();
                 let mut batch_row_count = 0u64;
+                let mut batch_payload_bytes = 0u64;
 
                 loop {
                     tokio::select! {
@@ -2066,7 +2067,7 @@ impl ExecutionPlan for KafkaSourceExec {
                                     converter.decode_and_buffer(&message).await?;
                                     watchdog.on_record();
                                     batch_row_count += 1;
-                                    metrics_recorder.record_count("input_rows", 1, metric_metadata_id.as_str());
+                                    batch_payload_bytes += message.payload().map_or(0, <[u8]>::len) as u64;
                                     if batch_row_count >= batch_size_limit {
                                         break;
                                     }
@@ -2084,6 +2085,9 @@ impl ExecutionPlan for KafkaSourceExec {
                 }
 
                 let payload_batch = converter.convert_to_batch()?;
+                if batch_payload_bytes > 0 {
+                    metrics_recorder.record_count("input_bytes_delta", batch_payload_bytes, metric_metadata_id.as_str());
+                }
 
                 let mut record_columns = payload_batch.columns().to_vec();
                 if append_op_column {

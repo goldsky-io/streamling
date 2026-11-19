@@ -618,6 +618,7 @@ async fn build_source_providers(
             }
             topology::Source::file(file) => {
                 let file = file.clone();
+                let metric_id = metric_key(application_id, reference_name.as_str());
                 let session_manager = session_manager.clone();
                 let state_backend_factory = Arc::clone(state_backend_factory);
                 let namespace = app_config.state_backend_namespace().to_string();
@@ -660,6 +661,7 @@ async fn build_source_providers(
                     };
                     let provider: Arc<dyn TableProvider> = FileSourceTableProvider::try_new(
                         &name,
+                        metric_id,
                         &file.path,
                         file.format,
                         mode,
@@ -1398,12 +1400,17 @@ impl Streamling {
                     );
                     let extracted_pk = clickhouse_source_provider.get_extracted_primary_key();
 
-                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
-                        clickhouse_source_provider,
-                        metric_key(&application_id, reference_name.as_str()),
-                        scan_sharing.clone(),
-                        clickhouse.telemetry.as_ref(),
-                    ));
+                    // The ClickHouse exec counts its input rows itself, before its
+                    // version dedup.
+                    let provider_with_telemetry = Arc::new(
+                        WrappingSourceTableProvider::new(
+                            clickhouse_source_provider,
+                            metric_key(&application_id, reference_name.as_str()),
+                            scan_sharing.clone(),
+                            clickhouse.telemetry.as_ref(),
+                        )
+                        .with_input_rows_id(None),
+                    );
 
                     self.register_operator_for_side_outputs(
                         reference_name.as_str(),
@@ -1469,15 +1476,19 @@ impl Streamling {
                             .with_shutdown(shutdown_rx.clone()),
                     );
 
-                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
-                        hybrid_source_provider.clone(),
-                        metric_key(&application_id, reference_name.as_str()),
-                        scan_sharing.clone(),
-                        // Outer wrapping passes None — telemetry is handled
-                        // by the per-phase inner providers above; emitting
-                        // here would double-count.
-                        None,
-                    ));
+                    let provider_with_telemetry = Arc::new(
+                        WrappingSourceTableProvider::new(
+                            hybrid_source_provider.clone(),
+                            metric_key(&application_id, reference_name.as_str()),
+                            scan_sharing.clone(),
+                            // Outer wrapping passes None — telemetry is handled
+                            // by the per-phase inner providers above; emitting
+                            // here would double-count.
+                            None,
+                        )
+                        // The phases count the rows they pull in as this node's input.
+                        .with_input_rows_id(None),
+                    );
                     hybrid_providers
                         .push((hybrid_source_provider, provider_with_telemetry.clone()));
 

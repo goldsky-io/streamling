@@ -17,6 +17,7 @@ use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
+use streamling_core::telemetry::recorder::get_metrics_recorder;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
@@ -66,6 +67,7 @@ pub(super) enum ReadEnd {
 /// What one partition's read loop needs besides its plan.
 pub(super) struct PartitionReader {
     pub(super) reference_name: String,
+    pub(super) metric_metadata_id: String,
     pub(super) object_store_url: ObjectStoreUrl,
     pub(super) file_source: Arc<dyn FileSource>,
     pub(super) projection: ScanProjection,
@@ -169,6 +171,14 @@ pub(super) async fn read_rounds<P: ReadPlan>(
             .limit
             .map(|limit| limit.saturating_sub(partition_emitted));
         let mut stream = reader.open_round(round.clone(), round_limit)?;
+        // Wire bytes: each file's full size when the round opens it. Like its rows,
+        // a round re-read after a stop or restart counts again.
+        let round_bytes: u64 = round.iter().map(|file| file.object_meta.size).sum();
+        get_metrics_recorder().record_count(
+            "input_bytes_delta",
+            round_bytes,
+            &reader.metric_metadata_id,
+        );
         while let Some(batch) = stream.next().await {
             let source_complete = inbox.drain(plan).await?;
             let batch = inbox.attach(build_output_batch(

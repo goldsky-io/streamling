@@ -1,3 +1,4 @@
+pub mod arrow_bytes;
 pub mod event_time_reader;
 pub mod provider;
 pub mod recorder;
