@@ -1095,6 +1095,12 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// batch count in `contains()` without changing results, because
 /// `build_contains_result` looks up every original row value in the returned
 /// set — not in `value_indices`.
+/// Postgres TEXT cannot store U+0000: binding such a value fails with 22021 on
+/// every retry, so it can never be in the table and can never be written.
+fn storable_in_postgres(value: &str) -> bool {
+    !value.contains('\0')
+}
+
 fn deduplicate_value_indices(value_indices: Vec<(usize, String)>) -> Vec<(usize, String)> {
     let mut seen: HashSet<String> = HashSet::new();
     value_indices
@@ -1115,7 +1121,16 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
             e
         })?;
 
-        let values = extract_string_values(values)?;
+        let mut values = extract_string_values(values)?;
+        let extracted_len = values.len();
+        values.retain(|value| storable_in_postgres(value));
+        if values.len() < extracted_len {
+            warn!(
+                table = %self.full_table_name,
+                dropped = extracted_len - values.len(),
+                "Dropping dynamic-table values containing NUL bytes; Postgres TEXT cannot store them"
+            );
+        }
         let values_len = values.len();
         if values_len == 0 {
             return Ok(());
@@ -1231,14 +1246,13 @@ impl DynamicTableBackend for PostgresDynamicTableBackend {
         }
 
         // Uncached queries need owned strings for retries.
+        // Unstorable values are left out of the query; `build_contains_result`
+        // then reports them absent, which is exact.
         let value_indices: Vec<(usize, String)> = (0..string_array.len())
-            .filter_map(|i| {
-                if !string_array.is_null(i) {
-                    Some((i, string_array.value(i).to_string()))
-                } else {
-                    None
-                }
-            })
+            .filter(|&i| !string_array.is_null(i))
+            .map(|i| (i, string_array.value(i)))
+            .filter(|(_, value)| storable_in_postgres(value))
+            .map(|(i, value)| (i, value.to_string()))
             .collect();
 
         // Deduplicate values so each unique value is queried only once.
@@ -1739,6 +1753,14 @@ mod tests {
         let result = deduplicate_value_indices(input);
 
         assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn storable_in_postgres_rejects_nul_bytes() {
+        assert!(storable_in_postgres("0xabc"));
+        assert!(storable_in_postgres(""));
+        assert!(!storable_in_postgres("0xabc\0"));
+        assert!(!storable_in_postgres("\0"));
     }
 
     #[test]
