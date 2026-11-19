@@ -33,6 +33,7 @@ use streamling_core::telemetry::provider::{
 use streamling_core::topology::{
     HybridBoundedSource, HybridOffsetTable, HybridUnboundedSource, Telemetry,
 };
+use streamling_core::utils::parse_primary_key_columns;
 use streamling_core::{streamling_err, streamling_user_bail};
 use streamling_state::{StateKey, StateOperatorBackend, StateOperatorBackendFactory};
 use tokio::sync::RwLock;
@@ -252,6 +253,10 @@ impl HybridTableProvider {
         bounded_sources: Vec<HybridBoundedSource>,
         unbounded_source: HybridUnboundedSource,
         offset_table: Option<HybridOffsetTable>,
+        // Column names the pipeline keys records on (parsed on ',' like the
+        // ClickHouse source). An absent nullable bounded column that is a key
+        // column must fail the build rather than backfill NULL keys.
+        primary_key: Option<String>,
         app_config: &AppConfig,
         state_backend_factory: &impl StateOperatorBackendFactory,
         session_manager: SessionManager,
@@ -338,6 +343,13 @@ impl HybridTableProvider {
         let schema_adapter = ClickHouseSchemaAdapter {
             client: ClickHouseClient::new(app_config.clickhouse_source.connection.clone()),
         };
+        let primary_key_columns: Vec<String> = primary_key
+            .as_deref()
+            .map(parse_primary_key_columns)
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         for (idx, bounded_source) in bounded_sources.into_iter().enumerate() {
             match bounded_source.source_type.as_str() {
                 "clickhouse" => {
@@ -359,10 +371,11 @@ impl HybridTableProvider {
                         unbounded_columns.len(),
                         unbounded_columns
                     );
-                    let columns = Some(
-                        schema_adapter
-                            .get_columns(bounded_source.table_name.as_str(), &unbounded_schema)?,
-                    );
+                    let columns = Some(schema_adapter.get_columns(
+                        bounded_source.table_name.as_str(),
+                        &unbounded_schema,
+                        &primary_key_columns,
+                    )?);
                     let clickhouse_provider = Arc::new(
                         ClickHouseTableProvider::new_source(
                             reference_name.clone(),
@@ -1842,22 +1855,25 @@ impl ClickHouseSchemaAdapter {
     /// Columns whose type differs are cast to the target type. Extra ClickHouse
     /// columns are not selected. A nullable target column absent from the table
     /// (e.g. a field the stored dataset dropped) is skipped here and filled with
-    /// nulls by `HybridSourceExec`; a missing non-nullable column is an error.
+    /// nulls by `HybridSourceExec`; a missing non-nullable column, an absent
+    /// primary-key column, or a table sharing no columns with the source schema
+    /// is an error.
     fn get_columns(
         &self,
         table_name: &str,
         target_schema: &SchemaRef,
+        primary_key_columns: &[String],
     ) -> Result<Vec<String>, DataFusionError> {
-        let table_schema = self
-            .client
-            .fetch_schema(table_name, None, None)
-            .map_err(|e| {
-                streamling_err!(
-                    "failed to fetch schema from ClickHouse for table '{}': {}",
-                    table_name,
-                    e
-                )
-            })?;
+        // Probe every column `system.columns` knows about: a `SELECT *` probe
+        // omits MATERIALIZED and ALIAS columns, which would make a real column
+        // look absent and get null-filled instead of read.
+        let table_schema = self.client.fetch_full_schema(table_name).map_err(|e| {
+            streamling_err!(
+                "failed to fetch schema from ClickHouse for table '{}': {}",
+                table_name,
+                e
+            )
+        })?;
 
         let all_clickhouse_columns: Vec<String> = table_schema
             .fields()
@@ -1872,7 +1888,12 @@ impl ClickHouseSchemaAdapter {
             all_clickhouse_columns
         );
 
-        let columns = Self::select_columns(table_name, &table_schema, target_schema)?;
+        let columns = Self::select_columns(
+            table_name,
+            &table_schema,
+            target_schema,
+            primary_key_columns,
+        )?;
         debug!(
             "Hybrid source bounded source (ClickHouse table '{}') selected columns matching unbounded schema ({}): {:?}",
             table_name,
@@ -1983,6 +2004,7 @@ impl ClickHouseSchemaAdapter {
         table_name: &str,
         table_schema: &SchemaRef,
         target_schema: &SchemaRef,
+        primary_key_columns: &[String],
     ) -> Result<Vec<String>, DataFusionError> {
         let table_fields: HashMap<&str, &Arc<Field>> = table_schema
             .fields()
@@ -2005,7 +2027,18 @@ impl ClickHouseSchemaAdapter {
                         columns.push(Self::convert_field_type(table_field, target_field));
                     }
                 }
-                None if target_field.is_nullable() => absent.push(target_field.name().as_str()),
+                None if target_field.is_nullable() => {
+                    if primary_key_columns.iter().any(|k| k == target_field.name()) {
+                        streamling_user_bail!(
+                            "column '{}' not found in ClickHouse table '{}' but it is part of the \
+                             source primary_key ({}); backfill rows would carry NULL keys",
+                            target_field.name(),
+                            table_name,
+                            primary_key_columns.join(", ")
+                        );
+                    }
+                    absent.push(target_field.name().as_str());
+                }
                 None => {
                     streamling_user_bail!(
                         "column '{}' not found in ClickHouse table '{}' (it is non-nullable in the \
@@ -2021,6 +2054,13 @@ impl ClickHouseSchemaAdapter {
                 "Hybrid source: ClickHouse table '{}' lacks nullable source column(s) {:?}; \
                  they will be null for rows read from the bounded phase",
                 table_name, absent
+            );
+        }
+        if columns.is_empty() {
+            streamling_user_bail!(
+                "ClickHouse table '{}' shares no columns with the source schema; \
+                 there is nothing to backfill",
+                table_name
             );
         }
         Ok(columns)
@@ -2537,9 +2577,13 @@ mod tests {
             ),
         ]));
 
-        let columns =
-            ClickHouseSchemaAdapter::select_columns("raw_traces", &table_schema, &target_schema)
-                .expect("nullable column absent from ClickHouse must not fail");
+        let columns = ClickHouseSchemaAdapter::select_columns(
+            "raw_traces",
+            &table_schema,
+            &target_schema,
+            &[],
+        )
+        .expect("nullable column absent from ClickHouse must not fail");
 
         assert_eq!(
             columns,
@@ -2602,12 +2646,71 @@ mod tests {
             Field::new("block_number", DataType::Int64, false),
         ]));
 
-        let err =
-            ClickHouseSchemaAdapter::select_columns("raw_traces", &table_schema, &target_schema)
-                .expect_err("a non-nullable column cannot be backfilled with nulls");
+        let err = ClickHouseSchemaAdapter::select_columns(
+            "raw_traces",
+            &table_schema,
+            &target_schema,
+            &[],
+        )
+        .expect_err("a non-nullable column cannot be backfilled with nulls");
         assert!(
             err.to_string()
                 .contains("column 'block_number' not found in ClickHouse table 'raw_traces'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn select_columns_rejects_absent_primary_key_column() {
+        // The column is nullable, so without the key guard it would be
+        // null-filled — unacceptable for a key column feeding sink upserts.
+        let table_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("user_id", DataType::Utf8, true),
+        ]));
+
+        let err = ClickHouseSchemaAdapter::select_columns(
+            "raw_traces",
+            &table_schema,
+            &target_schema,
+            &["user_id".to_string()],
+        )
+        .expect_err("an absent primary-key column cannot be backfilled with nulls");
+        assert!(
+            err.to_string()
+                .contains("column 'user_id' not found in ClickHouse table 'raw_traces'"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("primary_key"), "got: {err}");
+    }
+
+    #[test]
+    fn select_columns_rejects_schema_sharing_no_columns() {
+        // Every target column is nullable and absent: without this guard the
+        // select list is empty and the bounded scan fails opaquely (or reads
+        // an all-NULL backfill) instead of naming the real problem.
+        let table_schema = Arc::new(Schema::new(vec![Field::new(
+            "legacy",
+            DataType::Utf8,
+            false,
+        )]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new(COLUMN_NAME_OP, DataType::Utf8, false),
+            Field::new("b", DataType::Int64, true),
+        ]));
+
+        let err = ClickHouseSchemaAdapter::select_columns(
+            "raw_traces",
+            &table_schema,
+            &target_schema,
+            &[],
+        )
+        .expect_err("a table sharing no columns with the source schema cannot backfill");
+        assert!(
+            err.to_string()
+                .contains("shares no columns with the source schema"),
             "got: {err}"
         );
     }

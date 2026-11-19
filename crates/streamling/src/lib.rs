@@ -601,6 +601,7 @@ async fn build_source_providers(
                         hybrid.bounded_sources,
                         hybrid.unbounded_source,
                         hybrid.offset_table,
+                        hybrid.primary_key,
                         &app_config,
                         state_backend_factory.as_ref(),
                         session_manager,

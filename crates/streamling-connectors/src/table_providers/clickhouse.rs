@@ -2623,6 +2623,43 @@ impl ClickHouseClient {
         Ok(reader.schema())
     }
 
+    /// Arrow schema of `table_name` probed over every column `system.columns`
+    /// reports, including MATERIALIZED and ALIAS columns. The `SELECT *` probe
+    /// in `fetch_schema` omits both by default, so a real column would look
+    /// absent to schema matching; naming them explicitly is the only way to
+    /// read them. Sync (blocks internally): like `fetch_schema`, do not call
+    /// from an async context.
+    pub fn fetch_full_schema(&self, table_name: &str) -> streamling_core::error::Result<SchemaRef> {
+        let column_names = block_on(self.fetch_table_column_names(table_name))?;
+        if column_names.is_empty() {
+            return Err(streamling_core::streamling_err!(
+                "no columns listed in system.columns for table '{}'; does it exist?",
+                table_name
+            ));
+        }
+        let select_list = column_names
+            .iter()
+            .map(|n| format!("`{}`", n.replace('`', "``")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT {} FROM {} LIMIT 1 FORMAT Arrow",
+            select_list, table_name
+        );
+        let response_bytes = block_on(async {
+            let response_result = self.send_query(reqwest::Method::GET, query.as_str()).await;
+            self.process_http_response(response_result, query.as_str(), "schema")
+                .await
+        })?;
+
+        let reader = self.create_arrow_reader(response_bytes, &query)?;
+        debug!(
+            "ClickHouse full schema query returned Arrow schema: {:?}",
+            reader.schema()
+        );
+        Ok(reader.schema())
+    }
+
     pub fn fetch_sorting_keys(
         &self,
         database_name: &str,

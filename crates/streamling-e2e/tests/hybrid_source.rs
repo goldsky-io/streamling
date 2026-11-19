@@ -2224,3 +2224,192 @@ sinks:
         "Kafka is_deleted=null must survive the pipeline"
     );
 }
+
+// ============================================================================
+// Scenario 10: MATERIALIZED ClickHouse column invisible to the SELECT * probe
+// ============================================================================
+
+/// Nullable `region` field backed by a MATERIALIZED column in ClickHouse.
+/// `SELECT *` omits MATERIALIZED columns, so the schema probe used to miss
+/// them and the bounded phase null-filled a column that actually has data.
+const MATERIALIZED_FIELD_SCHEMA: &str = r#"{"type":"record","name":"TestMessageMaterialized","fields":[
+    {"name":"block","type":"long"},
+    {"name":"id","type":"string"},
+    {"name":"data","type":"string"},
+    {"name":"timestamp","type":"long"},
+    {"name":"region","type":["null","string"],"default":null}
+]}"#;
+
+#[derive(Debug, Clone, Serialize)]
+struct TestRecordMaterialized {
+    block: i64,
+    id: String,
+    data: String,
+    timestamp: i64,
+    region: Option<String>,
+}
+
+/// Bounded-phase records must read the MATERIALIZED column's real value
+/// instead of null-filling it; unbounded Kafka records pass through untouched.
+#[tokio::test]
+async fn test_hybrid_clickhouse_reads_materialized_column() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    // `region` is MATERIALIZED from `zone`: a real, readable column that
+    // `SELECT *` does not list.
+    clickhouse
+        .execute(
+            "CREATE TABLE hybrid_materialized_test (
+                block Int64,
+                id String,
+                data String,
+                timestamp Int64,
+                zone String,
+                region MATERIALIZED zone
+            ) ENGINE = MergeTree()
+            ORDER BY (block, id)",
+        )
+        .await
+        .expect("Failed to create ClickHouse table");
+
+    clickhouse
+        .execute(
+            "INSERT INTO hybrid_materialized_test VALUES
+            (1, 'Mat_A', 'A', 0, 'eu-1'),
+            (2, 'Mat_B', 'B', 0, 'us-1'),
+            (3, 'Mat_C', 'C', 0, 'ap-1')",
+        )
+        .await
+        .expect("Failed to insert ClickHouse data");
+
+    ctx.kafka
+        .register_schema(MATERIALIZED_FIELD_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+
+    let kafka_records: Vec<TestRecordMaterialized> = vec![
+        TestRecordMaterialized {
+            block: 201,
+            id: "kafka_region_1".to_string(),
+            data: "kafka_data_1".to_string(),
+            timestamp: 3001,
+            region: Some("kafka-eu".to_string()),
+        },
+        TestRecordMaterialized {
+            block: 202,
+            id: "kafka_region_2".to_string(),
+            data: "kafka_data_2".to_string(),
+            timestamp: 3002,
+            region: None,
+        },
+    ];
+
+    ctx.kafka
+        .produce_avro_records(&kafka_records)
+        .await
+        .expect("Failed to produce Kafka records");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE kafka_offsets_materialized (
+                topic String,
+                partition Int32,
+                offset UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY (topic, partition)",
+        )
+        .await
+        .expect("Failed to create offset table");
+
+    let pipeline = format!(
+        r#"
+sources:
+  hybrid_source:
+    type: hybrid
+    bounded_sources:
+      - source_type: clickhouse
+        table_name: hybrid_materialized_test
+        columns: block,id,data,timestamp
+    unbounded_source:
+      source_type: kafka
+      topic: {kafka_topic}
+      start_at: earliest
+    offset_table:
+      topic_name: {kafka_topic}
+      table_name: kafka_offsets_materialized
+    primary_key: id
+
+transforms: {{}}
+
+sinks:
+  pg_sink:
+    type: postgres
+    from: hybrid_source
+    table: hybrid_materialized_results
+    schema: public
+    primary_key: id
+    on_conflict: update
+"#,
+        kafka_topic = ctx.kafka_topic,
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline,
+            PipelineOpts::new()
+                .record_limit(5) // 3 from ClickHouse + 2 from Kafka
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+
+    assert!(
+        status.success(),
+        "Pipeline must read a MATERIALIZED column that SELECT * does not list"
+    );
+
+    let rows: Vec<(String, Option<String>)> = ctx
+        .postgres
+        .query("SELECT id, region FROM public.hybrid_materialized_results ORDER BY id")
+        .await
+        .expect("Failed to query postgres");
+
+    let by_id: std::collections::HashMap<String, Option<String>> = rows.into_iter().collect();
+
+    // Bounded (ClickHouse) records carry the MATERIALIZED column's real
+    // value — not the NULLs a probe that misses MATERIALIZED columns would
+    // have produced.
+    assert_eq!(
+        by_id.get("Mat_A"),
+        Some(&Some("eu-1".to_string())),
+        "ClickHouse record 'Mat_A' must read the MATERIALIZED region value"
+    );
+    assert_eq!(
+        by_id.get("Mat_B"),
+        Some(&Some("us-1".to_string())),
+        "ClickHouse record 'Mat_B' must read the MATERIALIZED region value"
+    );
+    assert_eq!(
+        by_id.get("Mat_C"),
+        Some(&Some("ap-1".to_string())),
+        "ClickHouse record 'Mat_C' must read the MATERIALIZED region value"
+    );
+
+    // Unbounded (Kafka) records: the field passes through untouched.
+    assert_eq!(
+        by_id.get("kafka_region_1"),
+        Some(&Some("kafka-eu".to_string())),
+        "Kafka region must survive the pipeline"
+    );
+    assert_eq!(
+        by_id.get("kafka_region_2"),
+        Some(&None),
+        "Kafka region=null must survive the pipeline"
+    );
+}
