@@ -93,3 +93,53 @@ pub fn build_projection_for_postgres(
         Ok(input)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ListArray, StringArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::prelude::SessionContext;
+    use streamling_core::types::decimal_arb::DecimalArbArrayBuilder;
+
+    /// Nested leaves wider than Postgres NUMERIC's precision cap are still
+    /// written exactly as JSONB strings by the projection.
+    #[tokio::test]
+    async fn nested_decimal_arb_leaves_become_exact_json_values() {
+        let wide_digits = "9".repeat(1200);
+        let wide_leaf = Arc::new(DecimalArbType::field("item", 1200, 0, true).unwrap());
+        let mut builder = DecimalArbArrayBuilder::with_capacity(1, "item", 1200, 0).unwrap();
+        builder.append_str(&wide_digits).unwrap();
+        let (raw, _, _) = builder.finish().into_inner();
+        let wide = ListArray::try_new(
+            Arc::clone(&wide_leaf),
+            OffsetBuffer::new(vec![0, 1, 1].into()),
+            Arc::new(raw),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wide",
+            DataType::List(wide_leaf),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(wide)]).unwrap();
+        let ctx = SessionContext::new();
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None).unwrap();
+        let plan = build_projection_for_postgres(&ctx.state(), input, &schema).unwrap();
+        let out = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let text = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(text.value(0), format!("[\"{wide_digits}\"]"));
+        assert_eq!(text.value(1), "[]");
+    }
+}

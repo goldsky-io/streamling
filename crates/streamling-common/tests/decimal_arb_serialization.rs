@@ -13,7 +13,7 @@ use std::{str::FromStr, sync::Arc};
 use streamling_common::{
     formats::{
         FromArrowConverter, ToArrowConverter,
-        avro::{serialize, to_avro},
+        avro::{serialize, try_to_avro},
         ipc::{FromArrowToIpcConverter, FromIpcToArrowConverter},
         json::{FromArrowToJsonConverter, JsonToArrowConverter},
     },
@@ -398,8 +398,8 @@ fn avro_first_decimal(v: &AvroValue) -> BigInt {
 fn ipc_nested_echo_to_avro_preserves_1000() {
     let input = nested_decimal(80, 0, "1000");
     let output = bridge_ipc(&input, input.schema()).unwrap();
-    let schema = to_avro("Test", output.schema().fields());
-    let actual = avro_first_decimal(&serialize(&schema, &output)[0]);
+    let schema = try_to_avro("Test", output.schema().fields()).unwrap();
+    let actual = avro_first_decimal(&serialize(&schema, &output).unwrap()[0]);
     assert_eq!(actual, BigInt::from(1000));
 }
 #[test]
@@ -578,12 +578,12 @@ fn avro_twos_complement_precision_scale_boundary_grid() {
             }
             // Serialize the decoded batch back to real Avro bytes and re-read,
             // so both sign-magnitude↔two's-complement directions are exercised.
-            let writer = to_avro("RoundTrip", output.schema().fields());
+            let writer = try_to_avro("RoundTrip", output.schema().fields()).unwrap();
             let mut second = ConfluentAvroDecoder::new();
             second
                 .register_writer_schema(2, &serde_json::to_string(&writer).unwrap())
                 .unwrap();
-            for value in serialize(&writer, &output) {
+            for value in serialize(&writer, &output).unwrap() {
                 let mut framed = vec![0, 0, 0, 0, 2];
                 framed.extend(apache_avro::to_avro_datum(&writer, value).unwrap());
                 second.decode(&framed).unwrap();

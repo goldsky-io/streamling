@@ -174,9 +174,12 @@ impl JsonToArrowConverter {
                 .map(|f| {
                     // arrow_json has no Dictionary decoder: decode the value type and cast
                     // back in `convert_batch_to_original_schema`.
-                    // ponytail: top-level dictionaries only; a nested one still errors.
+                    // ponytail: other nested dictionaries still error. A dictionary-encoded
+                    // decimal_arb leaf, nested or not, keeps its metadata and is read as text.
                     if let DataType::Dictionary(_, value) = f.data_type() {
-                        return Ok(f.as_ref().clone().with_data_type(value.as_ref().clone()));
+                        return Ok(decimal_arb_leaves_as_text_field(
+                            &f.as_ref().clone().with_data_type(value.as_ref().clone()),
+                        ));
                     }
                     // Legacy leaves become their decimal_arb equivalent first, so the text
                     // rewrite reaches them too.
@@ -469,11 +472,9 @@ impl ToArrowConverter<String> for JsonToArrowConverter {
 mod tests {
     use super::*;
     use crate::types::decimal_arb::{DecimalArbArrayBuilder, DecimalArbType, DecimalArbValue};
-    use arrow_schema::{DataType, Fields};
+    use arrow_schema::Fields;
     use datafusion::arrow::array::*;
-    use datafusion::arrow::record_batch::RecordBatch;
     use std::str::FromStr;
-    use std::sync::Arc;
 
     /// Test schema with two fields: `a` (Int32, non-nullable) and
     /// `b` (Utf8, nullable). Used by the basic JSON converter tests.
@@ -777,6 +778,60 @@ mod tests {
         assert_eq!(scanned, 2);
     }
 
+    /// A dictionary-encoded decimal_arb column carrying the extension
+    /// metadata on its own field (the Arrow convention) is written as its
+    /// decimal text and read back from it — not as hex of the raw bytes.
+    #[test]
+    fn dictionary_encoded_decimal_arb_round_trips_as_decimal_text() {
+        use datafusion::arrow::compute::cast;
+        let mut b = DecimalArbArrayBuilder::with_capacity(3, "amount", 30, 2).unwrap();
+        b.append_str("12.34").unwrap();
+        b.append_null();
+        b.append_str("12.34").unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        let dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary));
+        let dict = cast(&raw, &dict_type).unwrap();
+        let field = Field::new("amount", dict_type, true).with_metadata(
+            DecimalArbType::field("amount", 30, 2, true)
+                .unwrap()
+                .metadata()
+                .clone(),
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![dict]).unwrap();
+
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
+            .unwrap();
+        let rows: Vec<String> = rows
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert!(rows[0].contains(r#""amount":"12.34""#), "{rows:?}");
+        assert!(rows[2].contains(r#""amount":"12.34""#), "{rows:?}");
+
+        let mut converter = JsonToArrowConverter::new(Arc::clone(&schema), false, None);
+        converter.buffer(r#"[{"amount":"12.34"},{"amount":null},{"amount":"-0.5"}]"#.to_string());
+        let read = converter.convert_to_batch().unwrap();
+        assert_eq!(read.schema(), schema);
+        let plain = cast(read.column(0), &DataType::LargeBinary).unwrap();
+        let plain = plain.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        let values: Vec<Option<String>> = (0..plain.len())
+            .map(|i| {
+                (!plain.is_null(i)).then(|| {
+                    DecimalArbValue::from_canonical_bytes_at_scale(plain.value(i), 2)
+                        .unwrap()
+                        .to_canonical_string()
+                })
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some("12.34".to_string()), None, Some("-0.50".to_string())]
+        );
+    }
+
     #[test]
     fn test_decimal_arb_round_trip_through_json() {
         // Schema: id (Int64) + amount (decimal_arb(80, 40)).
@@ -831,6 +886,78 @@ mod tests {
         );
         let row1 = String::from_utf8(serialized[1].clone()).unwrap();
         assert!(row1.contains(r#""amount":null"#));
+    }
+
+    /// 256-bit integer leaves nested in `List<Struct<..>>` / `List<..>` (the
+    /// plugin call-trace shape) serialize as their exact decimal values — the
+    /// encoding the Kafka JSON, webhook and print sinks share.
+    #[test]
+    fn nested_wide_int_leaves_serialize_as_their_values() {
+        use crate::types::decimal_arb_nested::fixtures::{
+            I256_MAX, I256_MIN, U256_MAX, wide_int_traces_batch,
+        };
+        let rows = FromArrowToJsonConverter::new()
+            .convert_from_batch(&wide_int_traces_batch())
+            .unwrap();
+        let rows: Vec<String> = rows
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                r#"{"id":1,"traces":[{"value":"1"},{"value":"1000000000000000000"}],"signed":["-1","0"]}"#
+                    .to_string(),
+                format!(
+                    r#"{{"id":2,"traces":[{{"value":"{U256_MAX}"}},{{"value":null}}],"signed":["{I256_MIN}","{I256_MAX}"]}}"#
+                ),
+            ]
+        );
+    }
+
+    /// A run-end-encoded decimal_arb column keeps its metadata on the values
+    /// field; unwrapping it used to drop that metadata, and the leaf printed
+    /// as the hex of its canonical bytes.
+    #[test]
+    fn run_end_encoded_leaves_serialize_as_their_values() {
+        use crate::types::decimal_arb_nested::fixtures::U256_MAX;
+        use datafusion::arrow::datatypes::Int32Type;
+
+        let values = Arc::new(DecimalArbType::field("values", 78, 0, true).unwrap());
+        let mut b = DecimalArbArrayBuilder::with_capacity(2, "v", 78, 0).unwrap();
+        b.append_str("1").unwrap();
+        b.append_str(U256_MAX).unwrap();
+        let (raw, _, _) = b.finish().into_inner();
+        let ree = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![1, 2]), &raw).unwrap();
+        let DataType::RunEndEncoded(run_ends, _) = ree.data_type().clone() else {
+            unreachable!()
+        };
+        let ree_type = DataType::RunEndEncoded(run_ends, values);
+        let ree = make_array(
+            ree.to_data()
+                .into_builder()
+                .data_type(ree_type.clone())
+                .build()
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ree", ree_type, true)])),
+            vec![ree],
+        )
+        .unwrap();
+        let rows: Vec<String> = FromArrowToJsonConverter::new()
+            .convert_from_batch(&batch)
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                r#"{"ree":"1"}"#.to_string(),
+                format!(r#"{{"ree":"{U256_MAX}"}}"#)
+            ]
+        );
     }
 
     // ------- nested decimal_arb JSON serialization (F6) -------
