@@ -40,6 +40,7 @@ use streamling_core::checkpoints::checkpoint_management::CheckpointControl;
 use streamling_core::data::COLUMN_NAME_OP;
 use streamling_core::error::Result;
 use streamling_core::session::SessionManager;
+use streamling_core::telemetry::task_wait::TaskWaitMeter;
 use streamling_core::topology::FileSourceFormat;
 use streamling_core::{streamling_user_bail, streamling_user_err};
 use streamling_state::StateOperatorBackend;
@@ -612,6 +613,7 @@ impl FileSourceExec {
             num_records_before_stop: self.num_records_before_stop,
             records_emitted: self.records_emitted.clone(),
             shutdown_rx: self.shutdown_rx.clone(),
+            task_wait: TaskWaitMeter::claim(&context),
             context: context.clone(),
         };
 
