@@ -64,7 +64,7 @@ use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
-use streamling_core::telemetry::task_wait::TaskWaitMeter;
+use streamling_core::telemetry::task_wait::{TaskWaitHandle, TaskWaitMeter};
 use streamling_core::topology::Telemetry;
 use streamling_state::{StateBackendError, StateKey, StateOperatorBackend};
 use tokio::sync::watch;
@@ -1800,12 +1800,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let mut query_retry_attempts: u32 = 0;
             let mut query_retry_backoff_ms: u64 = 100;
 
-            // Observe the process-wide shutdown signal between pages so a
-            // SIGTERM during a long bounded scan ends the stream at a page
-            // boundary instead of running the table to completion (and
-            // blowing the shutdown budget). Nothing past the last emitted
-            // page is checkpoint-covered, so a restart resumes from the last
-            // finalized cursor. The retry/timeout backoff sleeps below select
+            // Observe the process-wide shutdown signal between pages and
+            // between a page's chunks (`emit_page`) so a SIGTERM during a long
+            // bounded scan ends the stream early instead of running the table
+            // to completion (and blowing the shutdown budget). The cursor
+            // only advances past a completed page, so a restart resumes from
+            // the last finalized cursor. The retry/timeout backoff sleeps below select
             // on the same signal — an uncancellable 30s backoff would outlive
             // the shutdown budget all by itself.
             let mut shutdown = streamling_core::shutdown::subscribe();
@@ -2016,6 +2016,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         // Complete page. Emit all buffered batches, emitting one empty
                         // batch for an empty scan so buffered checkpoint messages flow.
                         let mut receiver_dropped = false;
+                        let mut shutdown_mid_page = false;
                         if total_rows_in_page == 0 {
                             info!("[{}] empty scan on range [{}, {})", reference_name, range_start, upper_bound);
                             let empty_batch = attach_checkpoints(RecordBatch::new_empty(empty_batch_schema.clone()));
@@ -2097,26 +2098,35 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                         }
                                     }
                                 }
-                                for batch in emit_batches.into_iter() {
-                                    for chunk in chunk_record_batch(batch, record_batch_size) {
-                                        // attach_checkpoints drains the buffered messages onto
-                                        // the first chunk it sees (and no-ops once empty), so
-                                        // checkpoint messages still ride exactly one emitted
-                                        // batch — the first chunk of the page.
-                                        let chunk = attach_checkpoints(chunk);
-                                        if task_wait.send(tx.send(Ok(chunk))).await.is_err() {
-                                            receiver_dropped = true;
-                                            break;
-                                        }
-                                    }
-                                    if receiver_dropped {
-                                        break;
+                                match emit_page(
+                                    emit_batches,
+                                    record_batch_size,
+                                    &tx,
+                                    &task_wait,
+                                    &shutdown,
+                                    &attach_checkpoints,
+                                )
+                                .await
+                                {
+                                    PageEmission::Complete => {}
+                                    PageEmission::ReceiverDropped => receiver_dropped = true,
+                                    PageEmission::ShutdownRequested => {
+                                        shutdown_mid_page = true;
                                     }
                                 }
                             }
                         }
                         if receiver_dropped {
                             warn!("ClickHouseSourceExec: receiver dropped during page {}", page_count);
+                            break;
+                        }
+                        if shutdown_mid_page {
+                            // The cursor stays at this page's start, so a
+                            // restart re-reads the page.
+                            info!(
+                                "[{}] shutdown requested; ending bounded scan mid-page {}",
+                                reference_name, page_count
+                            );
                             break;
                         }
 
@@ -2260,6 +2270,48 @@ fn chunk_record_batch(batch: RecordBatch, max_rows: usize) -> Vec<RecordBatch> {
         .step_by(max_rows)
         .map(|offset| batch.slice(offset, (n - offset).min(max_rows)))
         .collect()
+}
+
+/// How [`emit_page`] ended.
+#[derive(Debug, PartialEq)]
+enum PageEmission {
+    Complete,
+    ShutdownRequested,
+    ReceiverDropped,
+}
+
+/// Send a page's batches downstream in `record_batch_size` chunks.
+///
+/// Stops before the next chunk once shutdown is requested: one page can hold
+/// `page_size` rows (10M by default), and draining them all through a slow
+/// sink outlives the shutdown budget. The check runs before
+/// `attach_checkpoints`, so no buffered checkpoint message is dropped.
+async fn emit_page(
+    batches: Vec<RecordBatch>,
+    record_batch_size: usize,
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    task_wait: &TaskWaitHandle,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+    attach_checkpoints: impl Fn(RecordBatch) -> RecordBatch,
+) -> PageEmission {
+    for batch in batches {
+        for chunk in chunk_record_batch(batch, record_batch_size) {
+            if *shutdown.borrow() {
+                return PageEmission::ShutdownRequested;
+            }
+            // attach_checkpoints drains the buffered messages onto the first
+            // chunk it sees (and no-ops once empty), so checkpoint messages
+            // ride exactly one emitted batch.
+            if task_wait
+                .send(tx.send(Ok(attach_checkpoints(chunk))))
+                .await
+                .is_err()
+            {
+                return PageEmission::ReceiverDropped;
+            }
+        }
+    }
+    PageEmission::Complete
 }
 
 impl ClickHouseSourceExec {
@@ -4074,6 +4126,66 @@ mod tests {
 
     fn make_int64_batch(n: i64) -> RecordBatch {
         make_int64_batch_with_meta(n, None)
+    }
+
+    #[tokio::test]
+    async fn emit_page_stops_before_the_next_chunk_once_shutdown_is_requested() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // The emitter owns `tx`, so the channel closes when it returns.
+        let emitter = async move {
+            emit_page(
+                vec![make_int64_batch(100)],
+                10,
+                &tx,
+                &TaskWaitHandle::default(),
+                &shutdown_rx,
+                |b| b,
+            )
+            .await
+        };
+        let consumer = async {
+            rx.recv().await.expect("first chunk").expect("ok chunk");
+            shutdown_tx.send(true).expect("receiver alive");
+            let mut after_shutdown = 0;
+            while rx.recv().await.is_some() {
+                after_shutdown += 1;
+            }
+            after_shutdown
+        };
+        let (outcome, after_shutdown) = tokio::join!(emitter, consumer);
+
+        assert_eq!(outcome, PageEmission::ShutdownRequested);
+        // At most the chunk already in the channel plus the one blocked in
+        // `send` when the signal flipped — not the 9 left in the page.
+        assert!(
+            after_shutdown <= 2,
+            "{after_shutdown} chunks were emitted after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_page_sends_every_chunk_without_shutdown() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let outcome = emit_page(
+            vec![make_int64_batch(100)],
+            10,
+            &tx,
+            &TaskWaitHandle::default(),
+            &shutdown_rx,
+            |b| b,
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(outcome, PageEmission::Complete);
+        let mut chunks = 0;
+        while rx.recv().await.is_some() {
+            chunks += 1;
+        }
+        assert_eq!(chunks, 10);
     }
 
     #[test]

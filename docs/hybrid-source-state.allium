@@ -11,8 +11,8 @@
 --   - Recovery semantics on restart, including the silent fallback when
 --     hybrid phase state is absent
 --   - Phase advancement on bounded stream end
---   - Offset handoff: fetch + seed unbounded offsets at the
---     bounded -> unbounded transition
+--   - Offset handoff: snapshot unbounded offsets before the final
+--     bounded phase, seed them at the bounded -> unbounded transition
 --   - Job mode termination after the final bounded phase
 -- Excludes:
 --   - General checkpoint protocol (Marker/Ack/Finalizer) -- see
@@ -62,8 +62,8 @@ external entity UnboundedSource {
 }
 
 -- Side table maintained by the bounded backend that records the
--- unbounded source's high-watermark partition offsets. Read once at
--- the bounded -> unbounded handoff. Treated as opaque.
+-- unbounded source's high-watermark partition offsets. Read once, before
+-- the final bounded phase starts. Treated as opaque.
 external entity OffsetProvider {
     topic: String
 }
@@ -90,14 +90,14 @@ entity HybridSource {
     reference_name: String
     bounded_phases: List<BoundedSource>     -- ordered; length N >= 0
     unbounded_phase: UnboundedSource
-    offset_provider: OffsetProvider?        -- supplies offsets at handoff
+    offset_provider: OffsetProvider?        -- supplies the offset snapshot
     job_mode: Boolean                       -- terminate after final bounded phase
 
     -- Live phase state. Persisted as PersistedHybridPhase below.
     current_phase: Integer                  -- 0..N-1: bounded;
                                             -- N:     unbounded;
                                             -- >N:    finished
-    seeded_offsets: Set<PartitionOffset>?   -- recorded at bounded -> unbounded handoff
+    seeded_offsets: Set<PartitionOffset>?   -- snapshotted before the final bounded phase starts
 
     -- Persisted phase state (singular: at most one per source)
     persisted_phase: PersistedHybridPhase with hybrid = this
@@ -230,26 +230,48 @@ rule AdvanceFromBoundedPhase {
     ensures: HybridPhaseStatePersisted(hybrid)
 }
 
--- When advancing OUT of the last bounded phase, fetch unbounded
--- partition offsets from the offset provider and seed them into the
--- unbounded source's per-partition state BEFORE the unbounded phase
--- begins consuming. The offsets are also recorded in hybrid phase
--- state for diagnostic purposes.
+-- Before the last bounded phase starts scanning, fetch unbounded
+-- partition offsets from the offset provider and persist them in hybrid
+-- phase state. The bounded scan fixes its upper bound when it starts,
+-- while the offset provider's backend keeps ingesting from the
+-- unbounded topic. Offsets read at the handoff are ahead of that bound,
+-- and the rows in between would be read by neither phase. Offsets read
+-- before the scan starts are at or behind the bound; the unbounded
+-- phase re-reads the overlap.
 --
--- Seeding ensures the unbounded source resumes from the correct
--- position relative to where the final bounded phase left off, rather
--- than from its configured default (earliest/latest). After seeding,
--- the unbounded source's per-partition state contains a value for each
--- seeded partition, regardless of whether one already existed.
+-- A persisted snapshot is kept across restarts: a resumed scan's bound
+-- can only be higher than the one the snapshot was taken for. Job mode
+-- never runs the unbounded phase, so it takes no snapshot.
+rule SnapshotUnboundedOffsetsBeforeFinalBounded {
+    when: BoundedStreamStarting(hybrid)
+    requires: hybrid.is_in_bounded_phase
+    requires: hybrid.current_phase + 1 = hybrid.bounded_phases.count
+    requires: hybrid.offset_provider != null
+    requires: not hybrid.job_mode
+    requires: hybrid.seeded_offsets = null
+    ensures: hybrid.seeded_offsets =
+        hybrid.offset_provider.fetch_offsets(hybrid.unbounded_phase.topic)
+    ensures: HybridPhaseStatePersisted(hybrid)
+}
+
+-- When advancing OUT of the last bounded phase, seed the snapshotted
+-- offsets into the unbounded source's per-partition state BEFORE the
+-- unbounded phase begins consuming.
+--
+-- Seeding ensures the unbounded source resumes from the snapshot
+-- position, rather than from its configured default (earliest/latest).
+-- After seeding, the unbounded source's per-partition state contains a
+-- value for each seeded partition, regardless of whether one already
+-- existed.
 rule SeedUnboundedOffsetsAtHandoff {
     when: BoundedStreamEnded(hybrid)
     requires: hybrid.is_in_bounded_phase
     requires: hybrid.current_phase + 1 = hybrid.bounded_phases.count
     requires: hybrid.offset_provider != null
-    let offsets = hybrid.offset_provider.fetch_offsets(hybrid.unbounded_phase.topic)
-    ensures: hybrid.seeded_offsets = offsets
+    requires: not hybrid.job_mode
+    requires: hybrid.seeded_offsets != null
     ensures:
-        for offset in offsets:
+        for offset in hybrid.seeded_offsets:
             UnboundedPartitionOffsetSeeded(
                 source: hybrid.unbounded_phase,
                 offset: offset
@@ -486,13 +508,15 @@ surface HybridStateWriteContract {
 -- Effect (with recovery protocol + save_state retry): save_state
 --         retries on transient errors and ERROR-logs on exhaustion
 --         (HybridStateWriteContract / ErrorOnTerminalWriteFailure).
---         If the write still fails, durable unbounded offsets exist
---         without a corresponding hybrid phase state row; on the
---         next restart HybridSourceRecoversToUnbounded observes the
---         complete offsets and resumes the unbounded phase with a
---         WARN, instead of replaying bounded. The cost of FM6 is
---         now one restart + one WARN per occurrence, not an
---         indefinite stuck-in-bounded state.
+--         If the write still fails, the hybrid phase state row
+--         written by SnapshotUnboundedOffsetsBeforeFinalBounded
+--         still names the final bounded phase and holds the
+--         snapshot. On the next restart
+--         HybridSourceRecoversFromPhaseState resumes that phase
+--         from its cursor, and the handoff seeds the same snapshot
+--         again. If the hybrid row is absent as well,
+--         HybridSourceRecoversToUnbounded observes the complete
+--         offsets and resumes the unbounded phase with a WARN.
 -- Effect (pre-recovery protocol, retained as historical context):
 --         the silent fallback re-entered phase 0, ran bounded
 --         again, and on the next successful transition OVERWROTE
@@ -501,8 +525,7 @@ surface HybridStateWriteContract {
 --         insert timestamp on those rows was preserved because
 --         put() is INSERT ... ON CONFLICT DO UPDATE on data only
 --         (postgres backend; see streamling-state/postgres.rs).
--- Recovery: automatic on next restart via
---           HybridSourceRecoversToUnbounded. The retry inside
+-- Recovery: automatic on next restart. The retry inside
 --           save_state additionally absorbs transient backend
 --           errors before they reach FM6.
 -- Observed: a production state dump showed three first-insert
@@ -557,11 +580,11 @@ surface HybridStateWriteContract {
 --     runtime; only the silent missing-state fallback at startup
 --     can cause an apparent regression (FM1, FM2).
 --
--- I3: seeded_offsets, once populated, is only updated again on
---     subsequent passes through SeedUnboundedOffsetsAtHandoff. In
---     practice this happens at most once per hybrid source lifetime
---     because the source advances past the bounded phases only
---     once per process start.
+-- I3: seeded_offsets is populated once, by
+--     SnapshotUnboundedOffsetsBeforeFinalBounded, or by
+--     HybridSourceRecoversToUnbounded on fallback recovery. It is
+--     never overwritten while non-null, across restarts included.
+--     SeedUnboundedOffsetsAtHandoff only reads it.
 --
 -- I4: The three persisted state kinds (hybrid phase, bounded
 --     cursor, unbounded partition offsets) are independent: each
