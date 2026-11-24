@@ -241,12 +241,19 @@ impl WrappingSourceTableProvider {
     /// accurate lag calculations even when a source-level filter is configured. Same
     /// rationale applies to event-time instrumentation: the `WrappingExec` sits below
     /// the source filter so freshness metrics see the pre-filter row stream.
+    ///
+    /// `suppress_backpressure` marks the `WrappingExec` as a
+    /// [`BackpressureRole::FanOutProducer`] — set it for a scan-shared source,
+    /// which is stashed in `SharedSourceHandle` before the optimizer runs (so
+    /// the attribution rule can't reach it) and whose per-edge backpressure is
+    /// emitted by the `BroadcastStream` instead.
     fn wrap_with_side_outputs_before_filter(
         inner_exec: Arc<dyn ExecutionPlan>,
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
         input_rows_id: Option<String>,
+        suppress_backpressure: bool,
     ) -> Arc<dyn ExecutionPlan> {
         let below_filter = Self::wrap_below_filter(
             inner_exec,
@@ -254,6 +261,7 @@ impl WrappingSourceTableProvider {
             side_outputs,
             event_time_instrumentation,
             input_rows_id,
+            suppress_backpressure,
         );
         // The rows the source node outputs, after its filter: what downstream nodes receive.
         Arc::new(
@@ -268,14 +276,37 @@ impl WrappingSourceTableProvider {
         )
     }
 
+    /// The source's `SourceInput` wrapper measures its `node_wait` states, so it
+    /// carries the fan-out stamp.
     fn wrap_below_filter(
         inner_exec: Arc<dyn ExecutionPlan>,
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
         input_rows_id: Option<String>,
+        suppress_backpressure: bool,
     ) -> Arc<dyn ExecutionPlan> {
-        let source_input = WrappingRole::SourceInput { input_rows_id };
+        let source_input = |inner: Arc<dyn ExecutionPlan>,
+                            side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+                            instrumentation: Option<EventTimeInstrumentation>|
+         -> Arc<dyn ExecutionPlan> {
+            let exec = WrappingExec::new(
+                inner,
+                reference_name.to_string(),
+                side_outputs,
+                Vec::new(),
+                instrumentation,
+            )
+            .with_role(WrappingRole::SourceInput {
+                input_rows_id: input_rows_id.clone(),
+            });
+            Arc::new(if suppress_backpressure {
+                exec.suppress_backpressure()
+            } else {
+                exec
+            })
+        };
+
         // A pushed-down scan projection may sit above the source filter (the
         // filter plans against the full payload schema and the projection is
         // re-applied above it — see the Kafka source). See through the
@@ -288,15 +319,10 @@ impl WrappingSourceTableProvider {
                 .downcast_ref::<StreamingFilterExec>()
         {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
-                WrappingExec::new(
-                    source_exec,
-                    reference_name.to_string(),
-                    side_outputs.clone(),
-                    Vec::new(),
-                    event_time_instrumentation.clone(),
-                )
-                .with_role(source_input.clone()),
+            let wrapped_source = source_input(
+                source_exec,
+                side_outputs.clone(),
+                event_time_instrumentation.clone(),
             );
             // Mark the re-applied filter/projection as source-owned: they sit
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
@@ -323,15 +349,10 @@ impl WrappingSourceTableProvider {
 
         if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
-                WrappingExec::new(
-                    source_exec,
-                    reference_name.to_string(),
-                    side_outputs.clone(),
-                    Vec::new(),
-                    event_time_instrumentation.clone(),
-                )
-                .with_role(source_input.clone()),
+            let wrapped_source = source_input(
+                source_exec,
+                side_outputs.clone(),
+                event_time_instrumentation.clone(),
             );
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
@@ -346,29 +367,11 @@ impl WrappingSourceTableProvider {
                          Falling back to wrapping the filtered plan.",
                         reference_name, e
                     );
-                    Arc::new(
-                        WrappingExec::new(
-                            inner_exec,
-                            reference_name.to_string(),
-                            side_outputs,
-                            Vec::new(),
-                            event_time_instrumentation,
-                        )
-                        .with_role(source_input),
-                    )
+                    source_input(inner_exec, side_outputs, event_time_instrumentation)
                 }
             }
         } else {
-            Arc::new(
-                WrappingExec::new(
-                    inner_exec,
-                    reference_name.to_string(),
-                    side_outputs,
-                    Vec::new(),
-                    event_time_instrumentation,
-                )
-                .with_role(source_input),
-            )
+            source_input(inner_exec, side_outputs, event_time_instrumentation)
         }
     }
 }
@@ -453,13 +456,27 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // Scan-shared source: stashed as the SharedSourceHandle's base_exec
+            // before the optimizer runs, so unreachable by the attribution rule.
+            // Suppress its own emission — the BroadcastStream emits one per-edge
+            // series per consumer instead.
             let wrapped_exec = Self::wrap_with_side_outputs_before_filter(
                 inner_exec,
                 &reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
                 self.input_rows_id.clone(),
+                true,
             );
+
+            // This sub-plan is stashed in the SharedSourceHandle below and is
+            // unreachable by the main DownstreamAttributionRule pass. Attribute
+            // its upstream edges now (e.g. source -> this producer) so they carry
+            // a `downstream_id` instead of emitting an untagged `blocked` series;
+            // the producer's own WrappingExec stays suppressed (its per-consumer
+            // edges are emitted by the BroadcastStream).
+            let wrapped_exec =
+                crate::optimizer::attribute_scan_shared_producer_base_exec(wrapped_exec)?;
 
             // Get internal_buffer_size from Session config
             let internal_buffer_size =
@@ -480,6 +497,7 @@ impl TableProvider for WrappingSourceTableProvider {
                         wrapped_exec,
                         internal_buffer_size,
                         expected_count,
+                        Some(Arc::from(reference_name.as_str())),
                         registry.scope(),
                     ));
                     sources.insert(reference_name.clone(), handle.clone());
@@ -501,12 +519,15 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // No scan sharing: single linear downstream — the optimizer rule
+            // stamps Edge(downstream_id), so don't suppress here.
             Ok(Self::wrap_with_side_outputs_before_filter(
                 inner_exec,
                 &self.reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
                 self.input_rows_id.clone(),
+                false,
             ))
         }
     }
@@ -525,23 +546,6 @@ impl TableProvider for WrappingSourceTableProvider {
     }
 }
 
-/// Wrapper around `ExecutionPlan` that injects additional functionality like telemetry related
-/// attributes and dynamic tables
-#[derive(Debug)]
-pub struct WrappingExec {
-    inner: Arc<dyn ExecutionPlan>,
-    reference_name: String,
-    side_outputs: Vec<Arc<dyn SourceSideOutput>>,
-    forced_non_null_columns: Vec<String>,
-    adjusted_schema: SchemaRef,
-    /// Per-source event-time instrumentation. `None` when the source has no
-    /// `telemetry.event_time` configured. Cloned (shallowly) into every
-    /// reconstruction so per-source watermark state survives DataFusion
-    /// optimizer rewrites.
-    event_time_instrumentation: Option<EventTimeInstrumentation>,
-    role: WrappingRole,
-}
-
 /// What a `WrappingExec` measures for its topology node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WrappingRole {
@@ -553,6 +557,32 @@ pub enum WrappingRole {
     SourceInput { input_rows_id: Option<String> },
     /// The top of a source's plan, above its filter: the rows the source outputs.
     SourceOutput,
+}
+
+/// How this node's `node_wait{state="blocked"}` (yield->resume suspension) is
+/// attributed. Stamped by the `DownstreamAttributionRule` pass (and, for
+/// scan-sharing producers, at construction). Only `blocked` consults this;
+/// `starved` is node-local and always emits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BackpressureRole {
+    /// Single named downstream consumer -> `downstream_id=<plain name>`. Stored
+    /// as the *plain* name (metric_key prefix stripped) so it joins the
+    /// downstream's `id` tag.
+    Edge(String),
+    /// Downstream unresolved (rare) -> `downstream_id=""`. Still one series, with
+    /// a label key set identical to the attributed case.
+    #[default]
+    Unattributed,
+    /// Feeds a `BroadcastStream` fan-out (multi-sink or scan sharing). Don't emit
+    /// `blocked` here — the broadcast emits one per-edge series per consumer;
+    /// emitting the aggregate too would double count.
+    ///
+    /// Invariant: the two blocked-emission layers must never coexist for the
+    /// same node. Only stamp this (via [`WrappingExec::suppress_backpressure`])
+    /// on a node that actually feeds a `BroadcastStream`; using it on a non-
+    /// fan-out node would silently swallow that node's `blocked` series with no
+    /// per-edge emitter to replace it.
+    FanOutProducer,
 }
 
 /// The span of an input poll to attribute to `starved`. A poll only counts as
@@ -568,6 +598,26 @@ fn starved_span_for_poll<T, E>(poll_result: &Option<Result<T, E>>, waited: Durat
         Some(Ok(_)) => waited,
         _ => Duration::ZERO,
     }
+}
+
+/// Wrapper around `ExecutionPlan` that injects additional functionality like telemetry related
+/// attributes and dynamic tables
+#[derive(Debug, Clone)]
+pub struct WrappingExec {
+    inner: Arc<dyn ExecutionPlan>,
+    reference_name: String,
+    side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+    forced_non_null_columns: Vec<String>,
+    adjusted_schema: SchemaRef,
+    /// Per-source event-time instrumentation. `None` when the source has no
+    /// `telemetry.event_time` configured. Cloned (shallowly) into every
+    /// reconstruction so per-source watermark state survives DataFusion
+    /// optimizer rewrites.
+    event_time_instrumentation: Option<EventTimeInstrumentation>,
+    role: WrappingRole,
+    /// Downstream-attribution role for `node_wait{state="blocked"}`. Defaults to
+    /// `Unattributed`; the optimizer rule stamps `Edge`/`FanOutProducer`.
+    backpressure_role: BackpressureRole,
 }
 
 impl crate::operators::TopologyBoundary for WrappingExec {
@@ -618,12 +668,84 @@ impl WrappingExec {
             adjusted_schema,
             event_time_instrumentation,
             role: WrappingRole::Node,
+            backpressure_role: BackpressureRole::Unattributed,
         }
     }
 
     pub fn with_role(mut self, role: WrappingRole) -> Self {
         self.role = role;
         self
+    }
+
+    pub fn role(&self) -> &WrappingRole {
+        &self.role
+    }
+
+    /// The node's `reference_name` (metric_key form `"{app}::{name}"`). The
+    /// `DownstreamAttributionRule` uses it to name the downstream for children;
+    /// strip with `get_reference_name_from_metric_key` before using as a tag.
+    pub fn reference_name(&self) -> &str {
+        &self.reference_name
+    }
+
+    /// This node's backpressure attribution role.
+    pub fn backpressure_role(&self) -> &BackpressureRole {
+        &self.backpressure_role
+    }
+
+    /// Stamp a single named downstream consumer. `downstream_id` must be the
+    /// *plain* node name (not metric_key form) so it joins the downstream's `id`.
+    pub fn with_downstream_id(mut self, downstream_id: String) -> Self {
+        self.backpressure_role = BackpressureRole::Edge(downstream_id);
+        self
+    }
+
+    /// Stamp this node as a fan-out producer, suppressing its own `blocked`
+    /// emission (the `BroadcastStream` emits per-edge instead). Only call this on
+    /// a node that genuinely feeds a `BroadcastStream`; see the invariant on
+    /// [`BackpressureRole::FanOutProducer`].
+    pub fn suppress_backpressure(mut self) -> Self {
+        self.backpressure_role = BackpressureRole::FanOutProducer;
+        self
+    }
+
+    /// Clone this node with a different `backpressure_role` stamped on it.
+    ///
+    /// The `DownstreamAttributionRule` reaches each node behind an `Arc`, so it
+    /// can't mutate in place and must rebuild. Only `backpressure_role` changes;
+    /// every other field is carried over by the clone — notably `side_outputs`
+    /// (a `Vec<Arc<_>>`), so each call is one `Vec` allocation plus arc refcount
+    /// bumps. Cheap enough for a once-per-plan optimizer pass. (A struct-update
+    /// literal can't be used here because `WrappingExec` implements `Drop`.)
+    pub fn clone_with_role(&self, role: BackpressureRole) -> Self {
+        let mut cloned = self.clone();
+        cloned.backpressure_role = role;
+        cloned
+    }
+
+    /// The immediate wrapped plan. `children()` is *see-through* (it delegates to
+    /// `inner`, exposing `inner`'s children rather than `inner` itself), so the
+    /// `DownstreamAttributionRule` must use this accessor to recurse into `inner`
+    /// directly — otherwise an adjacent `WrappingExec` (e.g. an elided-identity
+    /// transform sitting directly on its source) would be skipped and never
+    /// stamped.
+    pub fn inner(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.inner
+    }
+
+    /// Clone this node with a different `backpressure_role` **and** a new `inner`.
+    /// Attribution preserves schema/partitioning, so the cached `adjusted_schema`
+    /// carries over unchanged. Used by the attribution rule to rebuild after
+    /// recursing into `inner` (see `inner`).
+    pub fn clone_with_role_and_inner(
+        &self,
+        role: BackpressureRole,
+        inner: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.backpressure_role = role;
+        cloned.inner = inner;
+        cloned
     }
 }
 
@@ -677,16 +799,18 @@ impl ExecutionPlan for WrappingExec {
         // SAME watermark state Arc — without this, DataFusion optimizer
         // rewrites would silently start a fresh watermark for every
         // reconstruction.
-        Ok(Arc::new(
-            WrappingExec::new(
-                new_inner,
-                self.reference_name.clone(),
-                self.side_outputs.clone(),
-                self.forced_non_null_columns.clone(),
-                self.event_time_instrumentation.clone(),
-            )
-            .with_role(self.role.clone()),
-        ))
+        let mut rebuilt = WrappingExec::new(
+            new_inner,
+            self.reference_name.clone(),
+            self.side_outputs.clone(),
+            self.forced_non_null_columns.clone(),
+            self.event_time_instrumentation.clone(),
+        )
+        .with_role(self.role.clone());
+        // Preserve the downstream-attribution role across reconstructions so an
+        // optimizer rewrite after the attribution pass cannot drop the stamp.
+        rebuilt.backpressure_role = self.backpressure_role.clone();
+        Ok(Arc::new(rebuilt))
     }
 
     fn execute(
@@ -742,25 +866,58 @@ impl ExecutionPlan for WrappingExec {
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
+        let backpressure_role = self.backpressure_role.clone();
 
         let schema = self.schema();
 
         let measured_stream = async_stream::stream! {
-            // `starved`: time in `data.next().await`, waiting on upstream.
-            // Remainder-carrying so sub-ms spans aren't truncated to zero at
-            // high throughput.
+            // node-wait idle states:
+            //  - `blocked`: suspended at `yield`, waiting for the downstream to
+            //    poll again (backpressure from below).
+            //  - `starved`: in `data.next().await`, waiting on upstream.
+            // Both use the remainder-carrying accumulator so sub-ms spans aren't
+            // truncated to zero at high throughput.
+            let mut blocked = MillisAccumulator::default();
             let mut starved = MillisAccumulator::default();
+            let mut last_yield: Option<Instant> = None;
             loop {
+                // Resume point: the span since the previous `yield` is the
+                // downstream-induced suspension (blocked). The first iteration
+                // has no prior yield. Upstream wait is measured below as `starved`.
+                if let Some(yielded_at) = last_yield.take() {
+                    blocked.add(yielded_at.elapsed());
+                }
+                let blocked_ms = blocked.take_whole_millis();
+                if blocked_ms > 0 {
+                    // `node_wait{state="blocked"}`, one emitter per edge:
+                    //  - Edge(id): downstream_id=name.
+                    //  - Unattributed: downstream_id="".
+                    //  - FanOutProducer: suppressed (the BroadcastStream emits
+                    //    per-edge instead — no double count).
+                    let downstream_id = match &backpressure_role {
+                        BackpressureRole::Edge(downstream_id) => Some(downstream_id.as_str()),
+                        BackpressureRole::Unattributed => Some(""),
+                        BackpressureRole::FanOutProducer => None,
+                    };
+                    if let Some(downstream_id) = downstream_id {
+                        metrics_recorder.record_count_w_tags(
+                            "node_wait",
+                            blocked_ms,
+                            vec![("state", "blocked"), ("downstream_id", downstream_id)],
+                            &metric_metadata_id,
+                        );
+                    }
+                }
+
                 let batch_start = Instant::now();
                 let batch_result = data.next().await;
                 let batch_elapsed = batch_start.elapsed();
-                // `starved`: time waiting on upstream for input. Node-local, so
-                // `downstream_id=""`; the label is present so a later `blocked`
-                // state can share the same key set. Only a delivered batch
-                // (`Some(Ok)`) counts; a `None` poll is EOF and a `Some(Err)`
-                // is an upstream failure — attribute nothing for either.
-                // A source's `SourceOutput` wrapper waits on its `SourceInput` wrapper,
-                // which already measures this node's input wait.
+                // `starved`: time waiting on upstream for input. Node-local (not
+                // an edge), so downstream_id="" to match the blocked label set.
+                // Only a delivered batch (`Some(Ok)`) counts; a `None` poll is EOF
+                // and a `Some(Err)` is an upstream failure — attribute nothing for
+                // either. A source's `SourceOutput` wrapper waits on its
+                // `SourceInput` wrapper, which already measures this node's input wait.
                 if role != WrappingRole::SourceOutput {
                     starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
                 }
@@ -841,6 +998,7 @@ impl ExecutionPlan for WrappingExec {
                                 }
                             }
                         }
+                        // The `SourceInput` wrapper below measures the source's blocked.
                         if role == WrappingRole::SourceOutput {
                             yield Ok(batch);
                             continue;
@@ -888,10 +1046,14 @@ impl ExecutionPlan for WrappingExec {
 
                         live_data_inspect.process(metric_metadata_id.as_str(), &batch).await;
 
+                        // Mark the yield instant; the loop's resume point measures
+                        // the downstream's request delay (the blocked span).
+                        last_yield = Some(Instant::now());
                         yield Ok(batch);
                     }
                     Err(e) => {
                         debug!("WrappingExec [{}]: Error from input stream, stream will terminate: {}", metric_metadata_id, e);
+                        // Intentionally do not set last_yield: terminal error yields are not blocked time.
                         yield Err(e);
                         return;
                     }
@@ -953,6 +1115,14 @@ impl WrappingDataSink {
             primary_key,
             event_time_instrumentation: EventTimeInstrumentation::from_telemetry(telemetry),
         }
+    }
+
+    /// The sink's `reference_name` (metric_key form `"{app}::{name}"`). The
+    /// `DownstreamAttributionRule` recovers it from a root `DataSinkExec` to name
+    /// the topmost transform's downstream; strip via
+    /// `get_reference_name_from_metric_key` before using as a tag.
+    pub fn reference_name(&self) -> &str {
+        &self.reference_name
     }
 }
 
@@ -1230,13 +1400,24 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                     }
                 }
 
-                let exec = Arc::new(WrappingExec::new(
-                    input_physical,
-                    reference_name.clone(),
-                    side_outputs,
-                    wrapping_node.forced_non_null_columns.clone(),
-                    EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
-                ));
+                let exec = {
+                    let wrapping_exec = WrappingExec::new(
+                        input_physical,
+                        reference_name.clone(),
+                        side_outputs,
+                        wrapping_node.forced_non_null_columns.clone(),
+                        EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
+                    );
+                    // A scan-shared transform is stashed as a SharedSourceHandle
+                    // base_exec before the optimizer runs (unreachable by the
+                    // rule), so suppress its own emission — the BroadcastStream
+                    // emits one per-edge series per consumer instead.
+                    if wrapping_node.enable_scan_sharing {
+                        Arc::new(wrapping_exec.suppress_backpressure())
+                    } else {
+                        Arc::new(wrapping_exec)
+                    }
+                };
 
                 // Check if we should store this in the scan sharing registry for future reuse
                 if wrapping_node.enable_scan_sharing {
@@ -1253,8 +1434,22 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             None,
                         )?)))
                     } else {
-                        // Create and store the handle for this transform
-                        let schema = exec.schema();
+                        // Create and store the handle for this transform.
+                        // `exec` (the suppressed producer WrappingExec plus its
+                        // whole upstream sub-plan) is stashed as the handle's
+                        // base_exec BEFORE the DownstreamAttributionRule runs, so
+                        // the main pass can't reach it. Attribute its upstream
+                        // edges now (e.g. `up_source -> this producer`) so they
+                        // carry a `downstream_id` instead of emitting an untagged
+                        // `blocked` series; the producer's own WrappingExec stays
+                        // suppressed (its per-consumer edges come from the
+                        // BroadcastStream). Mirrors the source path in
+                        // `WrappingSourceTableProvider::scan`.
+                        let attributed_exec =
+                            crate::optimizer::attribute_scan_shared_producer_base_exec(
+                                exec.clone(),
+                            )?;
+                        let schema = attributed_exec.schema();
                         let internal_buffer_size =
                             get_streamling_config(session_state)?.internal_buffer_size;
                         let expected_count =
@@ -1262,9 +1457,10 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                                 .unwrap_or(0);
                         let handle = Arc::new(SharedSourceHandle::new(
                             schema,
-                            exec.clone(),
+                            attributed_exec,
                             internal_buffer_size,
                             expected_count,
+                            Some(Arc::from(reference_name.as_str())),
                             // Transform scan sharing goes through the global
                             // SCAN_SHARING_REGISTRY, which no run loop owns, so
                             // there is no controller scope to thread here yet.
@@ -1457,6 +1653,7 @@ mod tests {
             vec![side_output],
             None,
             Some("test_source".to_string()),
+            false,
         );
 
         // The source's output counter sits on top, above its filter.
@@ -1541,6 +1738,7 @@ mod tests {
             })],
             None,
             Some("test_source".to_string()),
+            false,
         );
 
         let output = datafusion::physical_plan::collect(plan, ctx.task_ctx())
@@ -1582,6 +1780,7 @@ mod tests {
             vec![side_output],
             None,
             Some("test_source".to_string()),
+            false,
         );
 
         // The source's output counter sits on top, above its filter.
@@ -1636,6 +1835,7 @@ mod tests {
             vec![side_output],
             None,
             Some("test_source".to_string()),
+            false,
         );
 
         // Without a filter, the top-level plan should be WrappingExec directly
@@ -1672,6 +1872,7 @@ mod tests {
             vec![side_output],
             None,
             Some("test_source".to_string()),
+            false,
         );
 
         let task_ctx = Arc::new(TaskContext::default());
@@ -1869,6 +2070,7 @@ mod tests {
             Vec::new(),
             Some(inst),
             Some("test_source".to_string()),
+            false,
         );
 
         // result is StreamingFilterExec → child is WrappingExec with our instrumentation.
@@ -1945,11 +2147,11 @@ mod tests {
     }
 
     /// Drives a `WrappingExec` with a slow consumer so the yield->resume span
-    /// exceeds a millisecond; guards that the instrumented loop still delivers
-    /// every row without panicking or hanging. Uses an *unregistered* node id so
-    /// it doesn't mutate the global recorder (the emission returns early at the
-    /// metadata lookup; counter-registry dispatch is covered by
-    /// `node_wait_counter_is_registered`).
+    /// exceeds a millisecond and the `node_wait{state="blocked"}` path runs;
+    /// guards that the instrumented loop still delivers every row without
+    /// panicking or hanging. Uses an *unregistered* node id so it doesn't mutate
+    /// the global recorder (the emission returns early at the metadata lookup;
+    /// counter-registry dispatch is covered by `node_wait_counter_is_registered`).
     #[tokio::test]
     async fn wrapping_exec_streams_all_rows_under_slow_consumer() {
         let schema = test_schema();
@@ -1985,6 +2187,43 @@ mod tests {
             total_rows,
             test_batch().num_rows() * 3,
             "all rows must flow through the instrumented loop"
+        );
+    }
+
+    /// The `BackpressureRole` builders set the expected role, and
+    /// `with_new_children` carries it across reconstruction (so a post-attribution
+    /// optimizer rewrite can't drop the stamp).
+    #[test]
+    fn backpressure_role_builders_and_with_new_children_preserve_role() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(test_schema()));
+
+        let base = WrappingExec::new(leaf, "app::node".to_string(), vec![], vec![], None);
+        assert_eq!(base.backpressure_role(), &BackpressureRole::Unattributed);
+
+        let edge = base.clone().with_downstream_id("consumer".to_string());
+        assert_eq!(
+            edge.backpressure_role(),
+            &BackpressureRole::Edge("consumer".to_string())
+        );
+
+        let suppressed = base.suppress_backpressure();
+        assert_eq!(
+            suppressed.backpressure_role(),
+            &BackpressureRole::FanOutProducer
+        );
+
+        // with_new_children must carry the role across reconstruction.
+        let edge_arc: Arc<dyn ExecutionPlan> = Arc::new(edge);
+        let children: Vec<Arc<dyn ExecutionPlan>> =
+            edge_arc.children().into_iter().cloned().collect();
+        let rebuilt = edge_arc.with_new_children(children).unwrap();
+        let rebuilt_we = rebuilt
+            .downcast_ref::<WrappingExec>()
+            .expect("rebuilt node must still be a WrappingExec");
+        assert_eq!(
+            rebuilt_we.backpressure_role(),
+            &BackpressureRole::Edge("consumer".to_string())
         );
     }
 
@@ -2112,6 +2351,51 @@ mod tests {
             starved >= 10,
             "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
         );
+    }
+
+    /// A filtered source's `node_wait` states are measured by its `SourceInput`
+    /// wrapper, so only that wrapper emits `blocked`; the `SourceOutput` wrapper
+    /// above the filter emits none, or the source's blocked would count twice.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn only_source_input_wrapper_records_blocked() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        for (role, node_id, expect_blocked) in [
+            (
+                WrappingRole::SourceInput {
+                    input_rows_id: None,
+                },
+                "blocked_source_input",
+                true,
+            ),
+            (WrappingRole::SourceOutput, "blocked_source_output", false),
+        ] {
+            test_support::init_recorder_with_node(node_id);
+            let mem_table = MemTable::try_new(
+                test_schema(),
+                vec![vec![test_batch(), test_batch(), test_batch()]],
+            )
+            .unwrap();
+            let ctx = SessionContext::new();
+            let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+            let wrapping = Arc::new(
+                WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
+                    .with_role(role.clone()),
+            );
+            let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+            while let Some(batch) = stream.next().await {
+                batch.expect("batch must be Ok");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let blocked = test_support::node_wait_ms(node_id, "blocked", Some(""));
+            assert_eq!(
+                blocked >= 10,
+                expect_blocked,
+                "{role:?} recorded blocked={blocked}ms"
+            );
+        }
     }
 
     /// A filtered source has two wrappers: `SourceInput` below the filter and
@@ -2243,6 +2527,108 @@ mod tests {
             elapsed_compute, starved,
             "elapsed_compute ({elapsed_compute}ms) must equal starved ({starved}ms); \
              a mismatch means the input-wait fold used a different quantization than starved"
+        );
+    }
+
+    /// Drive a `WrappingExec` with the given `backpressure_role` under a slow
+    /// consumer (sleeps between polls so each yield→resume gap is real blocked
+    /// time) and return the rows streamed. The recorder must already be
+    /// initialized with `node_id`.
+    async fn run_under_slow_consumer(node_id: &str, role: BackpressureRole) -> usize {
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let wrapping = Arc::new(
+            WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
+                .clone_with_role(role),
+        );
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.expect("batch must be Ok").num_rows();
+            // Slow consumer: force >1ms of yield→resume backpressure per batch.
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        total_rows
+    }
+
+    /// Runtime proof of the fan-out suppression invariant: with an `Edge` role a
+    /// `WrappingExec` emits `node_wait{state="blocked", downstream_id=...}`, but
+    /// with `FanOutProducer` its blocked emission is skipped entirely (the
+    /// `BroadcastStream` owns that edge). Both nodes stream identical data under
+    /// the same slow consumer, so the FanOut node's absence of a blocked series
+    /// reflects suppression, not missing traffic.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn fanout_producer_suppresses_blocked_while_edge_emits() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let edge_id = "blocked_edge_unit_node";
+        let fanout_id = "blocked_fanout_unit_node";
+        test_support::init_recorder_with_nodes(&[edge_id, fanout_id]);
+
+        let expected_rows = test_batch().num_rows() * 3;
+
+        let edge_rows =
+            run_under_slow_consumer(edge_id, BackpressureRole::Edge("consumer".to_string())).await;
+        assert_eq!(edge_rows, expected_rows, "edge node must stream all rows");
+
+        let fanout_rows =
+            run_under_slow_consumer(fanout_id, BackpressureRole::FanOutProducer).await;
+        assert_eq!(
+            fanout_rows, expected_rows,
+            "fan-out node must stream all rows too (absence of metric is suppression, not missing data)"
+        );
+
+        // Edge role: emits blocked, attributed to its named downstream.
+        let edge_blocked = test_support::node_wait_ms(edge_id, "blocked", Some("consumer"));
+        assert!(
+            edge_blocked >= 4,
+            "Edge role must emit blocked for downstream_id=consumer, got {edge_blocked}ms"
+        );
+
+        // FanOutProducer role: no blocked series for this node at all (any
+        // downstream_id), because emission is suppressed in favor of the
+        // BroadcastStream's per-edge series.
+        let fanout_blocked = test_support::node_wait_ms(fanout_id, "blocked", None);
+        assert_eq!(
+            fanout_blocked, 0,
+            "FanOutProducer must suppress its own blocked emission, got {fanout_blocked}ms"
+        );
+    }
+
+    /// Complements `fanout_producer_suppresses_blocked_while_edge_emits`: an
+    /// `Edge` role stamps the emitted `blocked` series with exactly the named
+    /// `downstream_id`, so a query pinning the wrong consumer sees nothing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn edge_role_blocked_carries_downstream_id_tag() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "blocked_edge_tag_node";
+        test_support::init_recorder_with_node(node_id);
+
+        let rows =
+            run_under_slow_consumer(node_id, BackpressureRole::Edge("real_sink".to_string())).await;
+        assert_eq!(rows, test_batch().num_rows() * 3);
+
+        assert!(
+            test_support::node_wait_ms(node_id, "blocked", Some("real_sink")) >= 4,
+            "blocked must be tagged with the real downstream_id"
+        );
+        assert_eq!(
+            test_support::node_wait_ms(node_id, "blocked", Some("wrong_sink")),
+            0,
+            "no blocked series should exist for a downstream the node doesn't feed"
         );
     }
 
