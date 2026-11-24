@@ -65,6 +65,7 @@ use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_canc
 use streamling_core::telemetry::arrow_bytes::batch_data_bytes;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
+use streamling_core::telemetry::task_wait::{TaskWaitHandle, TaskWaitMeter};
 use streamling_core::topology::Telemetry;
 use streamling_state::{StateBackendError, StateKey, StateOperatorBackend};
 use tokio::sync::watch;
@@ -1595,7 +1596,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let schema = self.provider.schema.clone();
         let metric_metadata_id = self.provider.metric_metadata_id.clone();
@@ -1606,6 +1607,9 @@ impl ExecutionPlan for ClickHouseSourceExec {
             .source_params
             .as_ref()
             .ok_or_else(|| streamling_err!("ClickHouseSourceExec is not a source"))?;
+        // The scan runs in a spawned task. Reading pages is the source's own
+        // work (`busy`); only the backoff while ClickHouse fails is `starved`.
+        let task_wait = TaskWaitMeter::claim(&context);
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             schema.clone(),
@@ -1939,7 +1943,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 }
                                 Err(e) => {
                                     error!("Error processing ClickHouse batch: {}", e);
-                                    if tx.send(Err(DataFusionError::ArrowError(Box::new(e), None))).await.is_err() {
+                                    if task_wait.send(tx.send(Err(DataFusionError::ArrowError(Box::new(e), None)))).await.is_err() {
                                         warn!("ClickHouseSourceExec: receiver dropped while sending error");
                                     }
                                     stream_failed = true;
@@ -1970,12 +1974,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 // split further. Surface it rather than silently skip
                                 // data — a key exceeding MAX_PAGE_BYTES alone would
                                 // overflow Arrow's per-array limit.
-                                let _ = tx.send(Err(DataFusionError::from(streamling_core::streamling_err!(
+                                let _ = task_wait.send(tx.send(Err(DataFusionError::from(streamling_core::streamling_err!(
                                     "ClickHouse source: range [{}, {}) at min width still exceeds page limits \
                                      (page_size={}, {} rows; max_page_bytes={}, {} bytes)",
                                     range_start, upper_bound, page_size, total_rows_in_page,
                                     MAX_PAGE_BYTES, total_page_bytes
-                                )))).await;
+                                ))))).await;
                                 break;
                             }
                             // Probe the exact row count for this range so the next
@@ -2025,7 +2029,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         if total_rows_in_page == 0 {
                             info!("[{}] empty scan on range [{}, {})", reference_name, range_start, upper_bound);
                             let empty_batch = attach_checkpoints(RecordBatch::new_empty(empty_batch_schema.clone()));
-                            if tx.send(Ok(empty_batch)).await.is_err() {
+                            if task_wait.send(tx.send(Ok(empty_batch))).await.is_err() {
                                 receiver_dropped = true;
                             }
                         } else {
@@ -2058,13 +2062,13 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                             }
                                             Ok(deduped) => (vec![deduped], false),
                                             Err(e) => {
-                                                let _ = tx
+                                                let _ = task_wait.send(tx
                                                     .send(Err(DataFusionError::from(
                                                         streamling_err!(
                                                             "ClickHouse source dedup failed: {}",
                                                             e
                                                         ),
-                                                    )))
+                                                    ))))
                                                     .await;
                                                 break;
                                             }
@@ -2080,7 +2084,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 let empty_batch = attach_checkpoints(RecordBatch::new_empty(
                                     empty_batch_schema.clone(),
                                 ));
-                                if tx.send(Ok(empty_batch)).await.is_err() {
+                                if task_wait.send(tx.send(Ok(empty_batch))).await.is_err() {
                                     receiver_dropped = true;
                                 }
                             } else {
@@ -2098,7 +2102,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                     {
                                         Ok(p) => emit_batches = p,
                                         Err(e) => {
-                                            let _ = tx.send(Err(e)).await;
+                                            let _ = task_wait.send(tx.send(Err(e))).await;
                                             break;
                                         }
                                     }
@@ -2107,6 +2111,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                     emit_batches,
                                     record_batch_size,
                                     &tx,
+                                    &task_wait,
                                     &shutdown,
                                     &attach_checkpoints,
                                 )
@@ -2170,10 +2175,14 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             page_count -= 1;
                             // Shutdown-aware backoff: fall through to the
                             // loop-top check as soon as the signal flips.
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_millis(1_000)) => {}
-                                _ = shutdown.changed() => {}
-                            }
+                            task_wait
+                                .wait_input(async {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(Duration::from_millis(1_000)) => {}
+                                        _ = shutdown.changed() => {}
+                                    }
+                                })
+                                .await;
                             continue;
                         }
 
@@ -2195,10 +2204,14 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         // Shutdown-aware backoff: a full 30s uncancellable
                         // sleep would outlive the shutdown budget on its own;
                         // fall through to the loop-top check on signal.
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-                            _ = shutdown.changed() => {}
-                        }
+                        task_wait
+                            .wait_input(async {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+                                    _ = shutdown.changed() => {}
+                                }
+                            })
+                            .await;
                         query_retry_backoff_ms = std::cmp::min(query_retry_backoff_ms.saturating_mul(2), 30_000);
                         continue;
                     }
@@ -2229,7 +2242,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                     empty_batch_schema.clone(),
                 );
                 if let Some(batch) = flush_batch
-                    && tx.send(Ok(batch)).await.is_err()
+                    && task_wait.send(tx.send(Ok(batch))).await.is_err()
                 {
                     warn!(
                         "ClickHouseSourceExec: receiver dropped before final checkpoint flush for {}",
@@ -2292,6 +2305,7 @@ async fn emit_page(
     batches: Vec<RecordBatch>,
     record_batch_size: usize,
     tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    task_wait: &TaskWaitHandle,
     shutdown: &tokio::sync::watch::Receiver<bool>,
     attach_checkpoints: impl Fn(RecordBatch) -> RecordBatch,
 ) -> PageEmission {
@@ -2303,7 +2317,11 @@ async fn emit_page(
             // attach_checkpoints drains the buffered messages onto the first
             // chunk it sees (and no-ops once empty), so checkpoint messages
             // ride exactly one emitted batch.
-            if tx.send(Ok(attach_checkpoints(chunk))).await.is_err() {
+            if task_wait
+                .send(tx.send(Ok(attach_checkpoints(chunk))))
+                .await
+                .is_err()
+            {
                 return PageEmission::ReceiverDropped;
             }
         }
@@ -4139,7 +4157,15 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // The emitter owns `tx`, so the channel closes when it returns.
         let emitter = async move {
-            emit_page(vec![make_int64_batch(100)], 10, &tx, &shutdown_rx, |b| b).await
+            emit_page(
+                vec![make_int64_batch(100)],
+                10,
+                &tx,
+                &TaskWaitHandle::default(),
+                &shutdown_rx,
+                |b| b,
+            )
+            .await
         };
         let consumer = async {
             rx.recv().await.expect("first chunk").expect("ok chunk");
@@ -4166,7 +4192,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let outcome = emit_page(vec![make_int64_batch(100)], 10, &tx, &shutdown_rx, |b| b).await;
+        let outcome = emit_page(
+            vec![make_int64_batch(100)],
+            10,
+            &tx,
+            &TaskWaitHandle::default(),
+            &shutdown_rx,
+            |b| b,
+        )
+        .await;
         drop(tx);
 
         assert_eq!(outcome, PageEmission::Complete);
