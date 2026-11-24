@@ -176,7 +176,7 @@ Who measures each state:
 |------|---------|------|
 | SQL transform | `WrappingExec` input poll minus the subtree's own DataFusion compute, which runs in the `CheckpointableExec` forwarder task | that compute (`OwnWork`) |
 | Handler / WASM / plugin transform | `TaskWaitMeter`: the task's input await | `TaskWaitMeter`: task time outside input and send awaits |
-| Kafka / ClickHouse / file / hybrid source | `TaskWaitMeter`: broker wait, failure backoff, idle file poll | `TaskWaitMeter`: fetch and decode |
+| Kafka / ClickHouse / file / hybrid source | `TaskWaitMeter`: broker wait, failure backoff, idle file poll | `TaskWaitMeter`: fetch and decode, and the Kafka offset commit / file progress persist on finalize |
 | Plugin source | `WrappingExec` input poll (the plugin's fetch and decode run out of process, so it is never split) | none |
 | Sink | `WrappingDataSink` input poll | time the connector holds a batch before it asks for the next one |
 

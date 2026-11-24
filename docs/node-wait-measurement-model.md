@@ -58,7 +58,9 @@ dropped, so a wait inside a losing `select!` branch still counts.
 
 A source is `starved` only while its external system has no data for it: a
 Kafka broker wait, a ClickHouse failure backoff, an idle file poll. Fetching
-and decoding available data is `busy`. A hybrid source reserves the meter at
+and decoding available data is `busy`. So is the source's own Kafka offset
+commit or file progress persist on a Finalizer: the sinks have acked, so it is
+not an input wait. A hybrid source reserves the meter at
 `execute`, and each phase source claims it in turn; the latest claim owns it.
 Each phase's own `WrappingExec` shares the reserved meter and emits no
 `node_wait`, so the hybrid's triad is under its YAML name, not the phase ids.
