@@ -992,3 +992,136 @@ sinks:
         "tied live+delete rows must both be dropped (delete wins the tie)"
     );
 }
+
+/// Regression for 650ee65 (adaptive sort-key-range pagination), which dropped
+/// the `ORDER BY` from the ClickHouse source page query. ClickHouse then
+/// returns a page's rows in arbitrary (parallel part read) order, but the
+/// ClickHouse sink's keep-last primary-key dedup — and ReplacingMergeTree's
+/// insert order — must see a key's rows in sort-key order. Otherwise an OLDER
+/// `block_number` row for an `id` that arrives after the newer one wins and
+/// the sink keeps stale state.
+///
+/// Every id has an OLD row at block 45873617 and a NEW row at block 45875305;
+/// all land in one page. The NEW rows are inserted first and the OLD rows
+/// last, in separate parts (merges stopped), so an unordered scan emits OLD
+/// rows after NEW ones. The sink (primary key `id`) must keep only NEW rows.
+#[tokio::test]
+async fn test_clickhouse_source_to_sink_latest_block_wins_per_key() {
+    init_tracing();
+
+    let ctx = TestContext::with_options(TestContextOptions::new().with_clickhouse())
+        .await
+        .expect("Failed to create test context");
+    let clickhouse = ctx.clickhouse.as_ref().expect("ClickHouse not initialized");
+
+    clickhouse
+        .execute(
+            "CREATE TABLE erc20_approvals (
+                id String,
+                block_number UInt64,
+                block_timestamp DateTime,
+                amount UInt64,
+                insert_timestamp DateTime,
+                is_deleted UInt8
+            ) ENGINE = ReplacingMergeTree(insert_timestamp, is_deleted)
+            ORDER BY (block_number, id)",
+        )
+        .await
+        .expect("Failed to create source table");
+
+    // Keep every INSERT as its own part: a background merge would rewrite
+    // them into one part sorted by (block_number, id), hiding the bug.
+    clickhouse
+        .execute("SYSTEM STOP MERGES erc20_approvals")
+        .await
+        .expect("Failed to stop merges");
+
+    const OLD_BLOCK: u64 = 45_873_617;
+    const NEW_BLOCK: u64 = 45_875_305;
+    const IDS_PER_INSERT: u64 = 1_000;
+    const INSERTS: u64 = 4;
+    let total_ids = IDS_PER_INSERT * INSERTS;
+
+    // (block, block_timestamp, amount, insert_timestamp); NEW rows first.
+    let versions = [
+        (NEW_BLOCK, "2026-08-25 16:34:02", "0", "2026-08-25 16:34:05"),
+        (
+            OLD_BLOCK,
+            "2026-08-25 16:31:12",
+            "980000 + number",
+            "2026-08-25 16:31:15",
+        ),
+    ];
+    for (block, block_ts, amount, insert_ts) in versions {
+        for chunk in 0..INSERTS {
+            clickhouse
+                .execute(&format!(
+                    "INSERT INTO erc20_approvals
+                     SELECT
+                         concat('0x', leftPad(lower(hex(number)), 40, '0'),
+                                '_0x5fc58f2ff3bc5bd77bc75ec3fa1ec5ec06b9d8a6') AS id,
+                         {block} AS block_number,
+                         toDateTime('{block_ts}') AS block_timestamp,
+                         {amount} AS amount,
+                         toDateTime('{insert_ts}') AS insert_timestamp,
+                         0 AS is_deleted
+                     FROM numbers({start}, {IDS_PER_INSERT})",
+                    start = chunk * IDS_PER_INSERT,
+                ))
+                .await
+                .expect("Failed to insert source data");
+        }
+    }
+
+    let pipeline = r#"
+sources:
+  ch_source:
+    type: clickhouse
+    table_name: erc20_approvals
+    primary_key: id
+
+transforms:
+  approvals:
+    type: sql
+    primary_key: id
+    sql: SELECT * FROM ch_source
+
+sinks:
+  ch_sink:
+    type: clickhouse
+    from: approvals
+    table: erc20_approvals_latest
+    primary_key: id
+"#;
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            pipeline,
+            // Bounded source completes naturally; the limit is a safety net.
+            PipelineOpts::new()
+                .record_limit(total_ids * 2)
+                .timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("Streamling execution failed");
+    assert!(status.success(), "pipeline should exit successfully");
+
+    let total = clickhouse
+        .count("SELECT count() FROM erc20_approvals_latest FINAL")
+        .await
+        .expect("count query failed");
+    assert_eq!(total, total_ids, "one sink row per id");
+
+    let stale = clickhouse
+        .count(&format!(
+            "SELECT countIf(block_number != {NEW_BLOCK} OR amount != 0) \
+             FROM erc20_approvals_latest FINAL"
+        ))
+        .await
+        .expect("stale count query failed");
+    assert_eq!(
+        stale, 0,
+        "every id must keep its NEW block {NEW_BLOCK} row (amount 0); \
+         {stale} of {total_ids} ids kept the OLDER block {OLD_BLOCK} row"
+    );
+}
