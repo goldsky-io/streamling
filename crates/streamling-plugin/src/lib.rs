@@ -1,6 +1,7 @@
 #![allow(non_local_definitions)]
 
 pub mod api;
+pub mod arrow_bytes;
 pub mod r#async;
 mod dispatch;
 pub mod ffi;
