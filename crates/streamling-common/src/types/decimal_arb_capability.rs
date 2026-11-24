@@ -243,6 +243,54 @@ pub fn capability_for_decimal_arb(
     }
 }
 
+/// [`capability_for_decimal_arb`] for a decimal_arb leaf nested inside a
+/// column (Struct / List / Map / …) rather than a top-level column.
+/// `coerce_to_string` is the directive on the top-level column the leaf
+/// belongs to; a directive cannot name a nested leaf.
+///
+/// Where it differs from the top-level decision:
+///
+/// - **ClickHouse**: the column's `coerce_to: string` turns *every* leaf under
+///   it into a `String`, narrow ones included — the directive is the one
+///   switch a nested leaf has. (A top-level column keeps its native
+///   `Decimal(p, s)` at precision ≤ 76 whatever the directive says, which
+///   existing tables rely on.) A wide unhinted leaf is rejected with a hint
+///   that does not point at `schema_override`, whose native-int pins match
+///   top-level columns only.
+/// - **Postgres**: a top-level Struct / List / LargeList / FixedSizeList / Map
+///   column is written as JSONB text, where a nested leaf is a decimal string
+///   of any precision, so `NUMERIC`'s precision cap does not apply to it. The
+///   validator applies that cap to leaves under any other top-level layout.
+pub fn capability_for_nested_decimal_arb(
+    kind: ConnectorKind,
+    precision: u32,
+    scale: u32,
+    coerce_to_string: bool,
+    native_int_kind: Option<crate::types::decimal_arb::NativeIntKind>,
+) -> CapabilityResult {
+    match kind {
+        ConnectorKind::ClickHouse => {
+            if coerce_to_string {
+                return CapabilityResult::OptInOnly(CoercionDirective::String);
+            }
+            match capability_for_decimal_arb(kind, precision, scale, false, native_int_kind) {
+                CapabilityResult::Reject(_) => CapabilityResult::Reject(format!(
+                    "ClickHouse Decimal precision is capped at {} digits; declared precision {} \
+                     exceeds the cap. Set `coerce_to: string` on the top-level column that holds \
+                     this field in the ClickHouse sink's `columns` setting \
+                     (`STREAMLING__CLICKHOUSE_SINK__COLUMNS` in the environment) to write its \
+                     decimal leaves as Strings, or reduce declared precision to ≤{} if the source \
+                     data fits.",
+                    MAX_CLICKHOUSE_DECIMAL_PRECISION, precision, MAX_CLICKHOUSE_DECIMAL_PRECISION,
+                )),
+                other => other,
+            }
+        }
+        ConnectorKind::Postgres => CapabilityResult::Native,
+        _ => capability_for_decimal_arb(kind, precision, scale, coerce_to_string, native_int_kind),
+    }
+}
+
 /// Build the user-facing config-load error string for a given Reject result.
 /// Centralizes the error format so every connector emits a consistent shape:
 /// column, connector, declared (p, s), reason, hint.
@@ -303,11 +351,6 @@ impl fmt::Display for DecimalArbConfigErrors {
     }
 }
 
-/// Connectors whose decimal_arb conversion covers only top-level columns.
-fn converts_only_top_level(kind: ConnectorKind) -> bool {
-    matches!(kind, ConnectorKind::ClickHouse | ConnectorKind::Hybrid)
-}
-
 /// `(precision, scale, native_int_kind)` of a decimal_arb field — or of a
 /// legacy `streamling.u256` / `streamling.i256` field, which every sink
 /// upgrades to a hinted `decimal_arb(78, 0)` on the way in and must therefore
@@ -317,6 +360,12 @@ fn decimal_arb_view(
 ) -> Option<(u32, u32, Option<crate::types::decimal_arb::NativeIntKind>)> {
     if let Some((p, s)) = DecimalArbType::precision_scale_from_field(field) {
         return Some((p, s, DecimalArbType::native_int_kind_from_field(field)));
+    }
+    // A dictionary- / run-end-encoded leaf carrying the metadata on its own
+    // field is checked as the plain leaf every sink unwraps it to.
+    if crate::formats::decimal_arb_text::is_encoded_decimal_arb_field(field) {
+        return crate::formats::decimal_arb_text::plain_layout_field(field)
+            .and_then(|plain| decimal_arb_view(&plain));
     }
     crate::types::decimal_arb_legacy::legacy_wide_int_kind(field).map(|kind| {
         (
@@ -353,6 +402,12 @@ fn collect_nested_decimal_arb(
     under_union: bool,
     out: &mut Vec<DecimalArbLeaf>,
 ) {
+    // An encoded leaf carrying the metadata on its own field is the leaf
+    // (`decimal_arb_view` reports it), not a layout holding one: descending
+    // into its values would check the same leaf twice.
+    if crate::formats::decimal_arb_text::is_encoded_decimal_arb_field(field) {
+        return;
+    }
     collect_nested_in_type(field.data_type(), path, under_union, out);
 }
 
@@ -393,9 +448,10 @@ fn collect_nested_in_type(
         | DataType::Map(c, _) => visit(c, path, under_union, out),
         DataType::RunEndEncoded(_, values) => visit(values, path, under_union, out),
         DataType::Union(fields, _) => fields.iter().for_each(|(_, f)| visit(f, path, true, out)),
-        // A dictionary's value type is a bare `DataType`, so it cannot be a
-        // decimal_arb leaf itself (the extension metadata lives on a field);
-        // it can still be a container holding one.
+        // A dictionary's value type is a bare `DataType`: a dictionary-encoded
+        // leaf carries the extension metadata on the dictionary field itself
+        // (picked up by `decimal_arb_view`), and the value type can still be
+        // a container holding one.
         DataType::Dictionary(_, values) => collect_nested_in_type(values, path, under_union, out),
         _ => {}
     }
@@ -411,13 +467,15 @@ fn collect_nested_in_type(
 /// Non-decimal_arb fields are ignored.
 ///
 /// Leaves nested inside a Struct / List / Map (or any other container layout)
-/// get the same decision as a top-level column would, under the column's
-/// directive: the connectors that serialise whole containers (JSON, Avro, …)
-/// carry the leaf exactly when they would carry the column. ClickHouse /
-/// Hybrid convert top-level columns only, so a nested leaf is rejected
-/// outright there rather than written as raw bytes, and a leaf anywhere inside
-/// a `Union` is rejected for every connector because nothing serialises
-/// decimal_arb through one.
+/// are decided by [`capability_for_nested_decimal_arb`] under the column's
+/// directive: every connector that writes whole containers (JSON, Avro,
+/// ClickHouse `Array` / `Tuple` / `Map`, Postgres JSONB, …) carries the leaf
+/// when it would carry the column, and Postgres carries it at any precision
+/// as JSON text under a column it writes as JSONB. Hybrid converts top-level
+/// columns only, so a nested
+/// leaf is rejected outright there rather than written as raw bytes, and a
+/// leaf anywhere inside a `Union` is rejected for every connector because
+/// nothing serialises decimal_arb through one.
 pub fn validate_pipeline_decimal_arb(
     schema: &Schema,
     kind: ConnectorKind,
@@ -463,7 +521,7 @@ pub fn validate_pipeline_decimal_arb(
                 ));
                 continue;
             }
-            if i >= top_level && converts_only_top_level(kind) {
+            if i >= top_level && kind == ConnectorKind::Hybrid {
                 errors.push(config_load_error(
                     &path,
                     kind,
@@ -475,9 +533,25 @@ pub fn validate_pipeline_decimal_arb(
                 ));
                 continue;
             }
-            if let CapabilityResult::Reject(reason) =
+            // Postgres JSON-encodes only these top-level layouts
+            // (`postgres/projection.rs`); a leaf under any other reaches
+            // NUMERIC, whose cap then applies.
+            let nested = i >= top_level
+                && (!matches!(kind, ConnectorKind::Postgres)
+                    || matches!(
+                        field.data_type(),
+                        arrow_schema::DataType::Struct(_)
+                            | arrow_schema::DataType::List(_)
+                            | arrow_schema::DataType::LargeList(_)
+                            | arrow_schema::DataType::FixedSizeList(_, _)
+                            | arrow_schema::DataType::Map(_, _)
+                    ));
+            let capability = if nested {
+                capability_for_nested_decimal_arb(kind, precision, scale, coerce_to_string, hint)
+            } else {
                 capability_for_decimal_arb(kind, precision, scale, coerce_to_string, hint)
-            {
+            };
+            if let CapabilityResult::Reject(reason) = capability {
                 errors.push(config_load_error(&path, kind, precision, scale, &reason));
             }
         }
@@ -966,6 +1040,41 @@ mod tests {
         }
     }
 
+    /// A dictionary- or run-end-encoded leaf carrying its metadata on the
+    /// encoded field is one leaf, checked once under the column's own name.
+    #[test]
+    fn an_encoded_leaf_is_checked_once() {
+        use std::sync::Arc;
+        let wide = DecimalArbType::field("x", 100, 2, true).unwrap();
+        let dict = Field::new(
+            "x",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary)),
+            true,
+        )
+        .with_metadata(wide.metadata().clone());
+        let ree = Field::new(
+            "x",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::LargeBinary, true)),
+            ),
+            true,
+        )
+        .with_metadata(wide.metadata().clone());
+        for field in [dict, ree] {
+            let errs = validate_pipeline_decimal_arb(
+                &Schema::new(vec![field]),
+                ConnectorKind::ClickHouse,
+                &[],
+            )
+            .unwrap_err();
+            let msg = format!("{errs}");
+            assert_eq!(errs.len(), 1, "{msg}");
+            assert!(msg.contains("column `x`"), "{msg}");
+            assert!(!msg.contains("x.values"), "{msg}");
+        }
+    }
+
     #[test]
     fn validator_sees_leaves_under_every_container_layout() {
         use arrow_schema::{Fields, UnionFields, UnionMode};
@@ -1020,6 +1129,187 @@ mod tests {
                 .unwrap_err();
         let msg = format!("{}", errs);
         assert!(msg.contains("u.amt") && msg.contains("union"), "{msg}");
+    }
+
+    #[test]
+    fn validator_sees_a_dictionary_encoded_leaf_with_metadata_on_its_field() {
+        use std::sync::Arc;
+        // The Arrow convention for a dictionary-encoded extension type puts
+        // the extension metadata on the dictionary field itself; the leaf is
+        // checked as the plain decimal_arb the sinks unwrap it to.
+        let encoded = |name: &str| {
+            Field::new(
+                name,
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeBinary)),
+                true,
+            )
+            .with_metadata(
+                DecimalArbType::field(name, 100, 0, true)
+                    .unwrap()
+                    .metadata()
+                    .clone(),
+            )
+        };
+        let schema = Schema::new(vec![
+            encoded("top"),
+            Field::new("l", DataType::List(Arc::new(encoded("item"))), true),
+        ]);
+        let errs =
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err();
+        let msg = format!("{}", errs);
+        assert_eq!(errs.len(), 2, "{msg}");
+        for path in ["top", "l.item"] {
+            assert!(msg.contains(path), "{path} missing from: {msg}");
+        }
+    }
+
+    /// `traces: List<Struct<id Int64, value: leaf>>`, the shape plugins emit
+    /// for per-transaction call traces.
+    fn traces_schema(leaf: Field) -> Schema {
+        use std::sync::Arc;
+        let item = Field::new(
+            "item",
+            DataType::Struct(vec![Field::new("id", DataType::Int64, true), leaf].into()),
+            true,
+        );
+        Schema::new(vec![Field::new(
+            "traces",
+            DataType::List(Arc::new(item)),
+            true,
+        )])
+    }
+
+    #[test]
+    fn clickhouse_carries_nested_leaves_it_can_store_natively() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // ClickHouse holds UInt256 / Int256 / Decimal(p ≤ 76, s) inside
+        // Array / Tuple / Map, and the sink converts nested leaves, so these
+        // no longer need to be rejected.
+        for leaf in [
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field("value", 78, 0, true).unwrap(),
+                NativeIntKind::U256,
+            )
+            .unwrap(),
+            DecimalArbType::with_native_int_kind(
+                DecimalArbType::field("value", 78, 0, true).unwrap(),
+                NativeIntKind::I256,
+            )
+            .unwrap(),
+            DecimalArbType::field("value", 50, 5, true).unwrap(),
+        ] {
+            let schema = traces_schema(leaf);
+            assert!(
+                validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).is_ok(),
+                "{schema:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_nested_wide_leaf_needs_the_columns_coerce_to_string() {
+        let schema = traces_schema(DecimalArbType::field("value", 100, 18, true).unwrap());
+        let errs =
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &[]).unwrap_err();
+        let msg = format!("{errs}");
+        assert_eq!(errs.len(), 1, "{msg}");
+        assert!(msg.contains("traces.item.value"), "{msg}");
+        assert!(msg.contains("coerce_to: string"), "{msg}");
+
+        // The directive sits on the top-level column and covers every leaf in it.
+        let directives = [ColumnDirectiveView {
+            name: "traces",
+            coerce_to_string: true,
+        }];
+        assert!(
+            validate_pipeline_decimal_arb(&schema, ConnectorKind::ClickHouse, &directives).is_ok()
+        );
+    }
+
+    #[test]
+    fn clickhouse_nested_coerce_to_string_covers_every_leaf() {
+        use crate::types::decimal_arb::NativeIntKind;
+        // A nested leaf under a `coerce_to: string` column is a String
+        // whatever its precision or hint; a top-level narrow column under the
+        // same directive keeps its native Decimal.
+        for hint in [None, Some(NativeIntKind::U256)] {
+            assert_eq!(
+                capability_for_nested_decimal_arb(ConnectorKind::ClickHouse, 50, 0, true, hint),
+                CapabilityResult::OptInOnly(CoercionDirective::String)
+            );
+        }
+        assert_eq!(
+            capability_for_decimal_arb(ConnectorKind::ClickHouse, 50, 5, true, None),
+            CapabilityResult::Native
+        );
+        // Without the directive a nested leaf gets the top-level decision.
+        assert_eq!(
+            capability_for_nested_decimal_arb(ConnectorKind::ClickHouse, 50, 5, false, None),
+            CapabilityResult::Native
+        );
+    }
+
+    #[test]
+    fn postgres_nested_leaves_are_json_text_at_any_precision() {
+        // Postgres writes container columns as JSONB, where a leaf is a
+        // decimal string; NUMERIC's precision cap applies to top-level
+        // columns only, and no directive exists to opt a nested leaf out.
+        let schema = traces_schema(DecimalArbType::field("value", 1200, 0, true).unwrap());
+        assert!(validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]).is_ok());
+        let top = Schema::new(vec![DecimalArbType::field("value", 1200, 0, true).unwrap()]);
+        assert!(validate_pipeline_decimal_arb(&top, ConnectorKind::Postgres, &[]).is_err());
+    }
+
+    #[test]
+    fn postgres_caps_nested_leaves_outside_the_jsonb_layouts() {
+        use std::sync::Arc;
+        // Postgres JSON-encodes only top-level Struct / List / LargeList /
+        // FixedSizeList / Map columns; a leaf under any other layout reaches
+        // NUMERIC, so its cap applies at config load, not on every batch.
+        let leaf = || Arc::new(DecimalArbType::field("amt", 1200, 0, true).unwrap());
+        let list = || DataType::List(leaf());
+        let rejected = [
+            Field::new("c", DataType::ListView(leaf()), true),
+            Field::new("c", DataType::LargeListView(leaf()), true),
+            Field::new(
+                "c",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(list())),
+                true,
+            ),
+            Field::new(
+                "c",
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    leaf(),
+                ),
+                true,
+            ),
+        ];
+        for field in rejected {
+            let dt = field.data_type().clone();
+            let schema = Schema::new(vec![field]);
+            assert!(
+                validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]).is_err(),
+                "{dt} accepted"
+            );
+        }
+        let accepted = [
+            Field::new("c", list(), true),
+            Field::new("c", DataType::Struct(vec![leaf()].into()), true),
+        ];
+        for field in accepted {
+            let schema = Schema::new(vec![field]);
+            assert!(validate_pipeline_decimal_arb(&schema, ConnectorKind::Postgres, &[]).is_ok());
+        }
+    }
+
+    #[test]
+    fn hybrid_still_rejects_nested_leaves() {
+        let schema = traces_schema(DecimalArbType::field("value", 50, 5, true).unwrap());
+        let errs = validate_pipeline_decimal_arb(&schema, ConnectorKind::Hybrid, &[]).unwrap_err();
+        let msg = format!("{errs}");
+        assert!(msg.contains("traces.item.value"), "{msg}");
+        assert!(msg.contains("only top-level columns"), "{msg}");
     }
 
     #[test]

@@ -147,6 +147,23 @@ called from every sink-construction arm in `streamling/src/lib.rs`,
 so misconfigured pipelines fail at config-load with an actionable
 error naming the offending column and connector.
 
+## Nested sink columns
+
+A nested leaf is a scalar inside a container.
+ClickHouse writes supported leaves as native decimals, UInt256, or Int256.
+For wider leaves, set `coerce_to: string` on the containing column in `STREAMLING__CLICKHOUSE_SINK__COLUMNS`.
+The directive converts every nested decimal leaf in that column to a String.
+The sink converts only columns that the destination table contains.
+Nested range errors name the leaf path without an element index.
+
+Postgres writes nested decimals as exact strings inside JSONB for top-level Struct, List, LargeList, FixedSizeList, and Map columns.
+Other top-level layouts keep the NUMERIC precision limit of 1,000 digits.
+Postgres rejects wider leaves in those layouts at startup.
+
+Kafka Avro writes dictionary columns with nullable schemas because dictionary values can be null even when their Arrow field is non-nullable.
+The encoder returns cast errors with column paths instead of panicking.
+Rust callers must use `try_to_avro` and handle the `Result` from `serialize`.
+
 ## Known limitations
 
 What is not supported today:
@@ -279,6 +296,21 @@ pipeline against this list before upgrading.
   upgrade keep the inflated values; an upsert on the same key writes the
   correct value alongside, it does not rewrite history. Audit tables fed
   by a `Decimal(p, s > 0)` column before relying on old rows.
+
+## ClickHouse live smoke test
+
+Start the local environment with `just env-setup`, then run the grouped
+ignored fixture against its HTTP endpoint (no authentication):
+
+```bash
+E2E_CLICKHOUSE_URL=http://localhost:30123 cargo test --locked -p streamling-connectors nested_decimal_arb_round_trips_through_a_live_clickhouse -- --ignored
+```
+
+This writes through the real sink and checks ClickHouse's column types and
+rendered values for two zero-copy batch slices, nullable containers and
+leaves, nested native Decimal columns, Map values, a run-end encoded native
+integer column, and string coercion of narrow and hinted nested leaves.
+The test drops each temporary table before asserting the query results.
 
 ## Performance
 

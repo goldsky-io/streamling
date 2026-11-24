@@ -370,7 +370,7 @@ so the element is always a **struct**, not a scalar — which is what makes the 
 
 | Sink | Verdict | Why |
 |------|---------|-----|
-| **Kafka — Avro** | **CHANGE (new subject only)** | Avro wraps a nullable record in a union: element `true`→`false` flips `items: ["null", record]` → `items: record` (`to_avro`/`field_to_avro`, `writer.rs:61-118`). Only registered if the subject is absent (`kafka.rs:2378`); existing subjects untouched. |
+| **Kafka — Avro** | **CHANGE (new subject only)** | Avro wraps a nullable record in a union: element `true`→`false` flips `items: ["null", record]` → `items: record` (`try_to_avro`/`field_to_avro`, `writer.rs`). Only registered if the subject is absent (`kafka.rs:2378`); existing subjects untouched. |
 | **ClickHouse** | **no change** | `Nullable` is never applied to `Array`/`Tuple`/`Map` (`clickhouse.rs:2275`), so a struct element emits `Array(Tuple(...))` regardless. The `Array(Nullable(T))`→`Array(T)` delta only applies to a *scalar* `T`, which these UDFs never produce. |
 | **Tinybird** (plugin) | **no change** | Same complex-type guard (`sink.rs:517`, `!is_complex`) → `Array(Tuple(...))` regardless. Registers a datasource schema from the plan schema, but gated on first-creation (`ensure_datasource_exists`). |
 | **Postgres** | **no change** | All arrays → `JSONB` (`type_mapping.rs:45-53`); element name/nullability never inspected. Auto-DDLs `CREATE TABLE IF NOT EXISTS`. |
