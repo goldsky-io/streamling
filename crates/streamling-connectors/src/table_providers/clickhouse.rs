@@ -2949,8 +2949,8 @@ impl ClickHouseClient {
                 }
 
                 let normalized_type = match field.data_type() {
-                    DataType::Utf8View => DataType::Utf8,
-                    DataType::BinaryView => DataType::Binary,
+                    DataType::Utf8View => DataType::LargeUtf8,
+                    DataType::BinaryView => DataType::LargeBinary,
                     other => other.clone(),
                 };
 
@@ -3031,13 +3031,13 @@ impl ClickHouseClient {
                 let column = &batch.columns()[idx];
                 let original_field = &original_schema.fields()[idx];
                 match (original_field.data_type(), normalized_field.data_type()) {
-                    (DataType::Utf8View, DataType::Utf8) => {
-                        Ok(cast(column.as_ref(), &DataType::Utf8)
-                            .streamling_context("failed to cast Utf8View to Utf8")?)
+                    (DataType::Utf8View, DataType::LargeUtf8 | DataType::Utf8) => {
+                        Ok(cast(column.as_ref(), normalized_field.data_type())
+                            .streamling_context("failed to cast Utf8View for ClickHouse")?)
                     }
-                    (DataType::BinaryView, DataType::Binary) => {
-                        Ok(cast(column.as_ref(), &DataType::Binary)
-                            .streamling_context("failed to cast BinaryView to Binary")?)
+                    (DataType::BinaryView, DataType::LargeBinary | DataType::Binary) => {
+                        Ok(cast(column.as_ref(), normalized_field.data_type())
+                            .streamling_context("failed to cast BinaryView for ClickHouse")?)
                     }
                     // The FSB(32)+U256/I256 endian-flip arm is gone —
                     // no source produces those
@@ -4319,16 +4319,16 @@ mod tests {
         // Normalize the schema
         let normalized = ClickHouseClient::normalize_schema_for_clickhouse(&schema);
 
-        // Check that view types are converted
+        // Check that view types are converted to 64-bit Large* types (matching expand_views_at_output)
         assert_eq!(
             normalized.field(0).data_type(),
-            &DataType::Utf8,
-            "Utf8View should be converted to Utf8"
+            &DataType::LargeUtf8,
+            "Utf8View should be converted to LargeUtf8"
         );
         assert_eq!(
             normalized.field(1).data_type(),
-            &DataType::Binary,
-            "BinaryView should be converted to Binary"
+            &DataType::LargeBinary,
+            "BinaryView should be converted to LargeBinary"
         );
         assert_eq!(
             normalized.field(2).data_type(),
@@ -4340,6 +4340,116 @@ mod tests {
         assert_eq!(normalized.field(0).name(), "utf8_view_col");
         assert_eq!(normalized.field(1).name(), "binary_view_col");
         assert_eq!(normalized.field(2).name(), "regular_col");
+    }
+
+    #[test]
+    fn test_normalize_batch_for_clickhouse_casts_views_to_large_types() {
+        use arrow::array::{AsArray, BinaryViewArray, StringViewArray};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringViewArray::from(vec![
+                    Some("0x1234567890abcdef_long_string"),
+                    None,
+                ])),
+                Arc::new(BinaryViewArray::from_iter(vec![
+                    Some(b"0123456789abcdef_long_bytes".as_slice()),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let normalized_schema =
+            Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(&schema));
+        let out =
+            ClickHouseClient::normalize_batch_for_clickhouse(&batch, &normalized_schema).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::LargeUtf8);
+        assert_eq!(out.schema().field(1).data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            out.column(0).as_string::<i64>().value(0),
+            "0x1234567890abcdef_long_string"
+        );
+        assert!(out.column(0).is_null(1));
+        assert_eq!(
+            out.column(1).as_binary::<i64>().value(0),
+            b"0123456789abcdef_long_bytes"
+        );
+        assert!(out.column(1).is_null(1));
+    }
+
+    #[test]
+    fn test_normalize_batch_from_clickhouse_casts_strings_and_binaries_to_views() {
+        use arrow::array::{
+            Array, AsArray, BinaryArray, LargeStringArray, ListBuilder, StringBuilder,
+        };
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder
+            .values()
+            .append_value("nested_topic_long_value");
+        list_builder.append(true);
+        list_builder.append_null();
+
+        let ch_schema = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::LargeUtf8, true),
+            Field::new("raw", DataType::Binary, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            ch_schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![
+                    Some("0x1234567890abcdef_calldata"),
+                    None,
+                ])),
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"0123456789abcdef_raw".as_slice()),
+                    None,
+                ])),
+                Arc::new(list_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        let target = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
+                true,
+            ),
+        ]));
+
+        let out = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8View);
+        assert_eq!(out.schema().field(1).data_type(), &DataType::BinaryView);
+        assert_eq!(
+            out.column(0).as_string_view().value(0),
+            "0x1234567890abcdef_calldata"
+        );
+        assert!(out.column(0).is_null(1));
+        assert_eq!(
+            out.column(1).as_binary_view().value(0),
+            b"0123456789abcdef_raw"
+        );
+        assert!(out.column(1).is_null(1));
+        let list = out.column(2).as_list::<i32>();
+        assert_eq!(
+            list.values().as_string_view().value(0),
+            "nested_topic_long_value"
+        );
+        assert!(list.is_null(1));
     }
 
     #[test]
@@ -6702,6 +6812,18 @@ fn clickhouse_column_to_target(
     }
 
     let rebuilt: ArrayRef = match (column.data_type(), target.data_type()) {
+        (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+        | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => {
+            arrow::compute::cast(column.as_ref(), target.data_type()).map_err(|e| {
+                streamling_err!(
+                    "column '{}': failed to cast {:?} to {:?}: {}",
+                    target.name(),
+                    column.data_type(),
+                    target.data_type(),
+                    e
+                )
+            })?
+        }
         (DataType::List(s), DataType::List(t)) => {
             let list = column.as_list::<i32>();
             let Some((values, child)) = clickhouse_column_to_target(list.values(), s, t)? else {

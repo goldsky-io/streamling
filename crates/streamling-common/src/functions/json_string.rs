@@ -1,7 +1,7 @@
 use crate::formats::FromArrowConverter;
 use crate::formats::json::FromArrowToJsonConverter;
 use crate::functions::util::{get_array_from_arg, validate_arg_count};
-use datafusion::arrow::array::StringBuilder;
+use datafusion::arrow::array::{AsArray, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
@@ -56,23 +56,25 @@ impl ScalarUDFImpl for JsonStringFunc {
         validate_arg_count(&args, 1, None, self.name())?;
         let array = get_array_from_arg(&args.args[0])?;
 
-        // If Utf8/LargeUtf8, produce JSON-quoted strings
-        if matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        // If Utf8/LargeUtf8/Utf8View, produce JSON-quoted strings directly.
+        if matches!(
+            array.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
             let mut builder = StringBuilder::new();
             let len = array.len();
             for i in 0..len {
                 if array.is_null(i) {
                     builder.append_null();
                 } else {
-                    // Safe to use ScalarValue to extract string representation
-                    let v = datafusion::common::ScalarValue::try_from_array(array.as_ref(), i)?;
-                    let s = match v {
-                        datafusion::common::ScalarValue::Utf8(Some(s)) => s,
-                        datafusion::common::ScalarValue::LargeUtf8(Some(s)) => s,
+                    let s: &str = match array.data_type() {
+                        DataType::Utf8 => array.as_string::<i32>().value(i),
+                        DataType::LargeUtf8 => array.as_string::<i64>().value(i),
+                        DataType::Utf8View => array.as_string_view().value(i),
                         _ => unreachable!("type checked above"),
                     };
-                    // JSON-quote the string
-                    let quoted = serde_json::Value::String(s).to_string();
+                    let quoted = serde_json::to_string(s)
+                        .map_err(|e| streamling_err!("Failed to JSON-quote string: {}", e))?;
                     builder.append_value(quoted);
                 }
             }
@@ -171,6 +173,30 @@ mod tests {
         assert_eq!(s.value(0), "\"x\"");
         assert!(s.is_null(1));
         assert_eq!(s.value(2), "\"y\"");
+    }
+
+    #[test]
+    fn test_gs_json_string_utf8_view_array() {
+        use datafusion::arrow::array::StringViewArray;
+
+        let func = JsonStringFunc::new();
+        let long_calldata = "0x1234567890abcdef\"quoted\"\\slash";
+        let arr: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("short"),
+            None,
+            Some(long_calldata),
+        ]));
+        let args = make_args_from_array(arr, "v");
+        let out = func.invoke_with_args(args).unwrap();
+        let s = match out {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let s = s.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.value(0), "\"short\"");
+        assert!(s.is_null(1));
+        assert_eq!(s.value(2), serde_json::to_string(long_calldata).unwrap());
     }
 
     #[test]

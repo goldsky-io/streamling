@@ -574,6 +574,8 @@ impl HybridTableProvider {
         }
 
         match (bounded_type, unbounded_type) {
+            (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+            | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => true,
             // Nested field names can differ (for example "item" vs "element"):
             // Arrow/DataFusion producers label list children differently even
             // when the list semantics are identical.
@@ -1047,6 +1049,125 @@ impl HybridSourceExec {
     }
 }
 
+fn needs_view_coercion(source: &arrow_schema::DataType, target: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+
+    match (source, target) {
+        (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+        | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => true,
+        (DataType::List(s), DataType::List(t))
+        | (DataType::LargeList(s), DataType::LargeList(t))
+        | (DataType::FixedSizeList(s, _), DataType::FixedSizeList(t, _)) => {
+            needs_view_coercion(s.data_type(), t.data_type())
+        }
+        (DataType::Struct(s_fields), DataType::Struct(t_fields)) => t_fields.iter().any(|t| {
+            s_fields
+                .find(t.name())
+                .is_some_and(|(_, s)| needs_view_coercion(s.data_type(), t.data_type()))
+        }),
+        _ => false,
+    }
+}
+
+fn coerce_view_column(
+    column: &arrow::array::ArrayRef,
+    target: &arrow_schema::FieldRef,
+) -> DataFusionResult<Option<(arrow::array::ArrayRef, arrow_schema::FieldRef)>> {
+    use arrow::array::{
+        Array, ArrayRef, AsArray, FixedSizeListArray, LargeListArray, ListArray, StructArray,
+    };
+    use arrow_schema::{DataType, Field};
+
+    let rebuilt: ArrayRef = match (column.data_type(), target.data_type()) {
+        (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+        | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => {
+            arrow::compute::cast(column.as_ref(), target.data_type()).map_err(|e| {
+                DataFusionError::from(streamling_err!(
+                    "hybrid source: failed to cast column '{}' from {:?} to {:?}: {}",
+                    target.name(),
+                    column.data_type(),
+                    target.data_type(),
+                    e
+                ))
+            })?
+        }
+        (DataType::List(_), DataType::List(t)) => {
+            let list = column.as_list::<i32>();
+            let Some((values, child)) = coerce_view_column(list.values(), t)? else {
+                return Ok(None);
+            };
+            Arc::new(ListArray::try_new(
+                child,
+                list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )?)
+        }
+        (DataType::LargeList(_), DataType::LargeList(t)) => {
+            let list = column.as_list::<i64>();
+            let Some((values, child)) = coerce_view_column(list.values(), t)? else {
+                return Ok(None);
+            };
+            Arc::new(LargeListArray::try_new(
+                child,
+                list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )?)
+        }
+        (DataType::FixedSizeList(_, size), DataType::FixedSizeList(t, _)) => {
+            let list = column.as_fixed_size_list();
+            let Some((values, child)) = coerce_view_column(list.values(), t)? else {
+                return Ok(None);
+            };
+            Arc::new(FixedSizeListArray::try_new(
+                child,
+                *size,
+                values,
+                list.nulls().cloned(),
+            )?)
+        }
+        (DataType::Struct(s_fields), DataType::Struct(t_fields)) => {
+            let st = column.as_struct();
+            let mut changed = false;
+            let mut fields = Vec::with_capacity(t_fields.len());
+            let mut columns = Vec::with_capacity(t_fields.len());
+            for (i, t) in t_fields.iter().enumerate() {
+                let Some((j, s)) = s_fields.find(t.name()) else {
+                    return Ok(None);
+                };
+                let col = st.column(j);
+                changed |= i != j;
+                let (col, field) = match coerce_view_column(col, t)? {
+                    Some(c) => {
+                        changed = true;
+                        c
+                    }
+                    None => (Arc::clone(col), Arc::clone(s)),
+                };
+                columns.push(col);
+                fields.push(field);
+            }
+            if !changed {
+                return Ok(None);
+            }
+            Arc::new(StructArray::try_new(
+                fields.into(),
+                columns,
+                st.nulls().cloned(),
+            )?)
+        }
+        _ => return Ok(None),
+    };
+    let field = Field::new(
+        target.name(),
+        rebuilt.data_type().clone(),
+        target.is_nullable(),
+    )
+    .with_metadata(target.metadata().clone());
+    Ok(Some((rebuilt, Arc::new(field))))
+}
+
 /// Align a batch to `target` by selecting the target's columns by NAME.
 ///
 /// Inner phase plans do not reliably honor the projection pushed into the
@@ -1057,37 +1178,58 @@ impl HybridSourceExec {
 /// deliberately insensitive to both column order and extra columns.
 fn align_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> DataFusionResult<RecordBatch> {
     let batch_schema = batch.schema();
-    // Fast path: already the exact target shape (names, in order).
+    // Fast path: already the exact target shape (names, in order, and no view coercion needed).
     if batch_schema.fields().len() == target.fields().len()
         && batch_schema
             .fields()
             .iter()
             .zip(target.fields())
-            .all(|(a, b)| a.name() == b.name())
+            .all(|(a, b)| {
+                a.name() == b.name() && !needs_view_coercion(a.data_type(), b.data_type())
+            })
     {
         return Ok(batch.clone());
     }
 
-    let indices = target
-        .fields()
-        .iter()
-        .map(|field| {
-            batch_schema.index_of(field.name()).map_err(|_| {
-                DataFusionError::from(streamling_err!(
-                    "hybrid source: column '{}' required by the query is missing from an \
-                     inner phase batch (batch columns: {:?})",
-                    field.name(),
-                    batch_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                ))
-            })
-        })
-        .collect::<DataFusionResult<Vec<usize>>>()?;
+    let mut indices = Vec::with_capacity(target.fields().len());
+    let mut columns = Vec::with_capacity(target.fields().len());
+    let mut fields = Vec::with_capacity(target.fields().len());
+    let mut coerced = false;
 
-    batch.project(&indices).map_err(Into::into)
+    for target_field in target.fields() {
+        let idx = batch_schema.index_of(target_field.name()).map_err(|_| {
+            DataFusionError::from(streamling_err!(
+                "hybrid source: column '{}' required by the query is missing from an \
+                 inner phase batch (batch columns: {:?})",
+                target_field.name(),
+                batch_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+            ))
+        })?;
+        indices.push(idx);
+        let col = batch.column(idx);
+        if let Some((new_col, new_field)) = coerce_view_column(col, target_field)? {
+            columns.push(new_col);
+            fields.push(new_field);
+            coerced = true;
+        } else {
+            columns.push(Arc::clone(col));
+            fields.push(Arc::clone(&batch_schema.fields()[idx]));
+        }
+    }
+
+    if !coerced {
+        return batch.project(&indices).map_err(Into::into);
+    }
+
+    let aligned_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        batch_schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(aligned_schema, columns).map_err(Into::into)
 }
 
 impl DisplayAs for HybridSourceExec {
@@ -2242,6 +2384,111 @@ mod tests {
             &list(true),
             &list(false)
         ));
+    }
+
+    #[test]
+    fn string_and_binary_bounded_types_back_view_unbounded_types() {
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeUtf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Binary,
+            &DataType::BinaryView
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeBinary,
+            &DataType::BinaryView
+        ));
+        // Nested view target under a list is also compatible.
+        let bounded_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let unbounded_list =
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true)));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &bounded_list,
+            &unbounded_list
+        ));
+        // Reverse direction is not implicitly widened.
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8View,
+            &DataType::Utf8
+        ));
+    }
+
+    #[test]
+    fn align_batch_to_schema_coerces_string_and_binary_to_view() {
+        use arrow::array::{
+            Array, AsArray, BinaryArray, Int64Array, LargeStringArray, ListBuilder, StringBuilder,
+        };
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder
+            .values()
+            .append_value("long_nested_topic_value");
+        list_builder.append(true);
+        list_builder.append_null();
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("raw", DataType::Binary, true),
+            Field::new("input", DataType::LargeUtf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new("extra", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"0123456789abcdef".as_slice()),
+                    None,
+                ])),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("0x1234567890abcdef1234567890abcdef"),
+                    None,
+                ])),
+                Arc::new(list_builder.finish()),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
+                true,
+            ),
+        ]));
+
+        let aligned = align_batch_to_schema(&batch, &target_schema).unwrap();
+        assert_eq!(aligned.schema().field(0).data_type(), &DataType::Utf8View);
+        assert_eq!(aligned.schema().field(1).data_type(), &DataType::BinaryView);
+        assert_eq!(
+            aligned.column(0).as_string_view().value(0),
+            "0x1234567890abcdef1234567890abcdef"
+        );
+        assert!(aligned.column(0).is_null(1));
+        assert_eq!(
+            aligned.column(1).as_binary_view().value(0),
+            b"0123456789abcdef"
+        );
+        assert!(aligned.column(1).is_null(1));
+
+        let aligned_list = aligned.column(2).as_list::<i32>();
+        assert_eq!(
+            aligned_list.values().as_string_view().value(0),
+            "long_nested_topic_value"
+        );
+        assert!(aligned_list.is_null(1));
     }
 
     #[test]
