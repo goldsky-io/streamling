@@ -683,6 +683,16 @@ async fn continuous_file_source_idle_polls_are_starved() {
     assert!(s.starved("f_src") >= 2_000, "{s:?}");
     assert!(s.starved("f_src") > s.busy("f_src"), "{s:?}");
     assert!(s.starved("f_sink") > s.busy("f_sink"), "{s:?}");
+    // Each idle poll emits an empty heartbeat batch.
+    let empty = ms(
+        &ctx,
+        format!(
+            "streamling_node_empty_batches_total{{id=\"f_src\",instance=\"{}\"}}",
+            ctx.test_id
+        ),
+    )
+    .await;
+    assert!(empty >= 1, "f_src empty batches: {empty}");
 }
 
 // ============================================================================
