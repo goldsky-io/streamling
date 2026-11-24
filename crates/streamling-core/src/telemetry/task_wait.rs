@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_busy_span_is_reported_while_it_runs() {
+    async fn an_open_busy_span_accrues_while_it_runs() {
         let (meter, _handle) = claimed_meter();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(meter.totals().busy >= Duration::from_millis(20));
