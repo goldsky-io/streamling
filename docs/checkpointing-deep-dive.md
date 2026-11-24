@@ -406,9 +406,10 @@ Sinks often accumulate batches before flushing (for efficiency). The `BatchAccum
 | Metric | Type | Description |
 |--------|------|-------------|
 | `checkpoint_markers_sent` | Counter | Markers broadcast by coordinator |
-| `checkpoint_acks_received` | Counter | Acks received by coordinator |
+| `checkpoint_acks_received` | Counter | Acks received by coordinator (tagged by sink_id) |
 | `checkpoint_epochs_succeeded` | Counter | Epochs successfully finalized |
-| `checkpoint_epochs_failed` | Counter | Epochs that timed out |
+| `checkpoint_epochs_failed` | Counter | Epochs that timed out, or a terminal epoch that never finalized |
+| `checkpoint_epochs_unacked_by_sink` | Counter | Per failed epoch, +1 for each sink that never acked it (tagged by sink_id) |
 | `checkpoint_finalizers_sent` | Counter | Finalizer messages broadcast |
 | `checkpoint_epochs_in_flight` | Gauge | Non-finalized epochs (should be 0 or 1) |
 | `checkpoint_epoch_duration` | Timer | Time between consecutive finalizations |
