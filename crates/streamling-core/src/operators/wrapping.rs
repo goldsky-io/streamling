@@ -194,6 +194,9 @@ pub struct WrappingSourceTableProvider {
     /// `WrappingExec` constructed for this source so the running watermark
     /// state is not duplicated.
     event_time_instrumentation: Option<EventTimeInstrumentation>,
+    /// The node the rows entering this source count as input for: the source itself, a
+    /// hybrid source for its phases, or `None` for a hybrid source, whose phases count them.
+    input_rows_id: Option<String>,
 }
 
 impl WrappingSourceTableProvider {
@@ -205,11 +208,19 @@ impl WrappingSourceTableProvider {
     ) -> Self {
         Self {
             inner,
-            reference_name,
             side_outputs: Arc::new(RwLock::new(Vec::new())),
             scan_sharing_registry,
             event_time_instrumentation: EventTimeInstrumentation::from_telemetry(telemetry),
+            input_rows_id: Some(reference_name.clone()),
+            reference_name,
         }
+    }
+
+    /// Count the rows entering this source as input of `id` instead of this source: a
+    /// hybrid phase counts for its hybrid source. `None`: the source counts no input rows.
+    pub fn with_input_rows_id(mut self, id: Option<String>) -> Self {
+        self.input_rows_id = id;
+        self
     }
 
     pub fn get_inner(&self) -> Arc<dyn TableProvider> {
@@ -234,12 +245,14 @@ impl WrappingSourceTableProvider {
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
+        input_rows_id: Option<String>,
     ) -> Arc<dyn ExecutionPlan> {
         let below_filter = Self::wrap_below_filter(
             inner_exec,
             reference_name,
             side_outputs,
             event_time_instrumentation,
+            input_rows_id,
         );
         // The rows the source node outputs, after its filter: what downstream nodes receive.
         Arc::new(
@@ -259,7 +272,9 @@ impl WrappingSourceTableProvider {
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
+        input_rows_id: Option<String>,
     ) -> Arc<dyn ExecutionPlan> {
+        let source_input = WrappingRole::SourceInput { input_rows_id };
         // A pushed-down scan projection may sit above the source filter (the
         // filter plans against the full payload schema and the projection is
         // re-applied above it — see the Kafka source). See through the
@@ -280,7 +295,7 @@ impl WrappingSourceTableProvider {
                     Vec::new(),
                     event_time_instrumentation.clone(),
                 )
-                .with_role(WrappingRole::SourceInput),
+                .with_role(source_input.clone()),
             );
             // Mark the re-applied filter/projection as source-owned: they sit
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
@@ -315,7 +330,7 @@ impl WrappingSourceTableProvider {
                     Vec::new(),
                     event_time_instrumentation.clone(),
                 )
-                .with_role(WrappingRole::SourceInput),
+                .with_role(source_input.clone()),
             );
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
@@ -338,7 +353,7 @@ impl WrappingSourceTableProvider {
                             Vec::new(),
                             event_time_instrumentation,
                         )
-                        .with_role(WrappingRole::SourceInput),
+                        .with_role(source_input),
                     )
                 }
             }
@@ -351,7 +366,7 @@ impl WrappingSourceTableProvider {
                     Vec::new(),
                     event_time_instrumentation,
                 )
-                .with_role(WrappingRole::SourceInput),
+                .with_role(source_input),
             )
         }
     }
@@ -442,6 +457,7 @@ impl TableProvider for WrappingSourceTableProvider {
                 &reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                self.input_rows_id.clone(),
             );
 
             // Get internal_buffer_size from Session config
@@ -489,6 +505,7 @@ impl TableProvider for WrappingSourceTableProvider {
                 &self.reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                self.input_rows_id.clone(),
             ))
         }
     }
@@ -525,15 +542,15 @@ pub struct WrappingExec {
 }
 
 /// What a `WrappingExec` measures for its topology node.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WrappingRole {
     /// A transform: its output rows, plus compute, checkpoint and live-inspect telemetry.
     Node,
-    /// Directly above a source's connector, below its filter: side outputs, event-time
-    /// freshness and compute observe every row pulled in. Rows are not counted here.
-    SourceInput,
-    /// The top of a source's plan, above its filter: the rows the source outputs, which
-    /// downstream nodes count as their input.
+    /// Directly above a source's connector, below its filter: the rows pulled in count as
+    /// input of `input_rows_id` (none when the phases of a hybrid source count them), and
+    /// side outputs and event-time freshness observe every row.
+    SourceInput { input_rows_id: Option<String> },
+    /// The top of a source's plan, above its filter: the rows the source outputs.
     SourceOutput,
 }
 
@@ -652,7 +669,7 @@ impl ExecutionPlan for WrappingExec {
                 self.forced_non_null_columns.clone(),
                 self.event_time_instrumentation.clone(),
             )
-            .with_role(self.role),
+            .with_role(self.role.clone()),
         ))
     }
 
@@ -697,7 +714,7 @@ impl ExecutionPlan for WrappingExec {
         // whose input is directly the upstream topology boundary), the delta
         // path can never emit, so wall-clock stays on as the only available
         // signal rather than leaving the series dead.
-        let role = self.role;
+        let role = self.role.clone();
         // The output counter above a source's filter only counts rows: the input wrapper
         // below it already records this node's compute and checkpoint telemetry.
         let record_wall_clock_compute = role != WrappingRole::SourceOutput
@@ -731,13 +748,25 @@ impl ExecutionPlan for WrappingExec {
                         }
 
                         // Process telemetry
-                        if role != WrappingRole::SourceInput {
-                            metrics_recorder.record_execution_plan_metrics(
-                                metric_metadata_id.as_str(),
-                                batch.num_rows(),
-                                RowCountMeasurementType::OutputRowCount,
-                                metrics.as_ref(),
-                            );
+                        match &role {
+                            WrappingRole::Node | WrappingRole::SourceOutput => {
+                                metrics_recorder.record_execution_plan_metrics(
+                                    metric_metadata_id.as_str(),
+                                    &batch,
+                                    RowCountMeasurementType::OutputRowCount,
+                                    metrics.as_ref(),
+                                );
+                            }
+                            WrappingRole::SourceInput { input_rows_id } => {
+                                if let Some(input_rows_id) = input_rows_id {
+                                    metrics_recorder.record_execution_plan_metrics(
+                                        input_rows_id.as_str(),
+                                        &batch,
+                                        RowCountMeasurementType::SourceInputRowCount,
+                                        None,
+                                    );
+                                }
+                            }
                         }
                         if role == WrappingRole::SourceOutput {
                             yield Ok(batch);
@@ -882,7 +911,7 @@ impl DataSink for WrappingDataSink {
                     Ok(batch) => {
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
                         );
@@ -918,6 +947,7 @@ impl DataSink for WrappingDataSink {
                             }
                         };
 
+                        metrics_recorder.record_data_bytes("output_bytes_delta", &deduped_batch, &metric_metadata_id);
                         yield Ok(deduped_batch);
                     }
                     Err(e) => {
@@ -1353,6 +1383,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
 
         // The source's output counter sits on top, above its filter.
@@ -1400,6 +1431,57 @@ mod tests {
         );
     }
 
+    /// Side outputs at the source wrapper see every pre-filter row, while the
+    /// filter still drops rows above it. The row metrics are covered in
+    /// `recorder::pipeline_io_delta_tests`.
+    #[tokio::test]
+    async fn test_side_outputs_see_rows_before_source_filter() {
+        let schema = test_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>())),
+                Arc::new(Int64Array::from(
+                    (0..10).map(|i| i * 1000).collect::<Vec<i64>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    (0..10).map(|i| i < 3).collect::<Vec<bool>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = FilterExec::try_new(predicate, source_exec).unwrap();
+        let streaming_filter =
+            Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
+
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+        let plan = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            streaming_filter,
+            "test_source",
+            vec![Arc::new(CountingSideOutput {
+                rows_seen: rows_seen.clone(),
+            })],
+            None,
+            Some("test_source".to_string()),
+        );
+
+        let output = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let output_rows: usize = output.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows_seen.load(Ordering::Relaxed),
+            10,
+            "pre-filter rows at the source wrapper"
+        );
+        assert_eq!(output_rows, 3, "filter still applied above the wrapper");
+    }
+
     #[test]
     fn test_wrap_with_side_outputs_before_filter_reorders_plan() {
         let schema = test_schema();
@@ -1426,6 +1508,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
 
         // The source's output counter sits on top, above its filter.
@@ -1479,6 +1562,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
 
         // Without a filter, the top-level plan should be WrappingExec directly
@@ -1514,6 +1598,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
 
         let task_ctx = Arc::new(TaskContext::default());
@@ -1710,6 +1795,7 @@ mod tests {
             "test_source",
             Vec::new(),
             Some(inst),
+            Some("test_source".to_string()),
         );
 
         // result is StreamingFilterExec → child is WrappingExec with our instrumentation.

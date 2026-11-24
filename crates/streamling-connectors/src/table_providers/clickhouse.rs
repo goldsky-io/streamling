@@ -1591,6 +1591,8 @@ impl ExecutionPlan for ClickHouseSourceExec {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let schema = self.provider.schema.clone();
+        let metric_metadata_id = self.provider.metric_metadata_id.clone();
+        let metrics_recorder = get_metrics_recorder().clone();
 
         let source_params = self
             .provider
@@ -1906,7 +1908,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                 };
 
                 match run_result {
-                    Ok(mut stream) => {
+                    Ok(SourcePage { wire_bytes, batches: mut stream }) => {
                         query_retry_attempts = 0;
                         query_retry_backoff_ms = 100;
 
@@ -2125,6 +2127,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             break;
                         }
 
+                        // Only a fully emitted page counts what it pulled in: an overflowed or
+                        // abandoned page is re-read, and that read counts instead. Rows count
+                        // before the version dedup above, so the source's wrapper does not.
+                        metrics_recorder.record_count("input_bytes_delta", wire_bytes as u64, &metric_metadata_id);
+                        metrics_recorder.record_input_rows_count(total_rows_in_page as u64, &metric_metadata_id);
+
                         // Completed range: advance the cursor and persist it. on_complete
                         // moves range_start past this range; the while condition (is_done)
                         // ends the scan once the cursor passes max_key. On restart we re-read
@@ -2301,10 +2309,7 @@ impl ClickHouseSourceExec {
         client: ClickHouseClient,
         query: &str,
         limit: Option<usize>,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = arrow::error::Result<RecordBatch>> + Send>>,
-        DataFusionError,
-    > {
+    ) -> Result<SourcePage, DataFusionError> {
         let query = format!(
             "{} {} FORMAT Arrow",
             query,
@@ -2319,10 +2324,14 @@ impl ClickHouseSourceExec {
             .process_http_response(response_result, query.as_str(), "run")
             .await?;
 
+        let wire_bytes = response_bytes.len();
         let batches = decode_arrow_ipc_blocking(client, response_bytes, query).await;
 
         trace!("Created async record batch stream");
-        Ok(Box::pin(futures::stream::iter(batches)))
+        Ok(SourcePage {
+            wire_bytes,
+            batches: Box::pin(futures::stream::iter(batches)),
+        })
     }
 
     pub fn extract_keyset_from_batch(
@@ -2352,6 +2361,13 @@ impl ClickHouseSourceExec {
 
         Ok(keyset_values)
     }
+}
+
+/// One page read from a ClickHouse source query.
+pub struct SourcePage {
+    /// Bytes of the HTTP response body the page was decoded from.
+    pub wire_bytes: usize,
+    pub batches: Pin<Box<dyn Stream<Item = arrow::error::Result<RecordBatch>> + Send>>,
 }
 
 /// Decodes a ClickHouse Arrow IPC response on the blocking pool, so a large page
@@ -5535,6 +5551,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
 
         let arrow_bytes = create_test_arrow_ipc_bytes(&[1, 2, 3]);
+        let response_len = arrow_bytes.len();
         let _mock = server
             .mock("GET", "/")
             .match_query(mockito::Matcher::Any)
@@ -5547,7 +5564,12 @@ mod tests {
         let result = ClickHouseSourceExec::run(client, "SELECT id FROM test_table", None).await;
         assert!(result.is_ok(), "run() should succeed with valid Arrow IPC");
 
-        let mut stream = result.unwrap();
+        let page = result.unwrap();
+        assert_eq!(
+            page.wire_bytes, response_len,
+            "wire bytes = response body length"
+        );
+        let mut stream = page.batches;
         let mut row_count = 0;
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.expect("batch should be valid");
@@ -5744,7 +5766,10 @@ mod tests {
         for _ in 0..max_test_attempts {
             match ClickHouseSourceExec::run(client.clone(), "SELECT id FROM test_table", None).await
             {
-                Ok(mut stream) => {
+                Ok(SourcePage {
+                    batches: mut stream,
+                    ..
+                }) => {
                     query_retry_attempts = 0;
                     query_retry_backoff_ms = 100;
 
