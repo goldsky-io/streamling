@@ -375,9 +375,12 @@ impl Drop for SafeKafkaProducer {
             // Detached OS thread, not spawn_blocking — see SafeKafkaConsumer:
             // a blocking task queued during runtime shutdown never runs and
             // its closure is dropped inline on the shutdown thread, restoring
-            // the very deadlock this wrapper exists to prevent. The stream has
-            // already flushed by the time its producer drops, so abandoning
-            // the destroy at process exit loses nothing.
+            // the very deadlock this wrapper exists to prevent. A stream that
+            // ends cleanly has flushed already. On an error or cancellation,
+            // the destroy delivers the last acks, so their BatchDelivery
+            // records can land late or be lost at exit. Those rows all follow
+            // the last acked checkpoint, so the restart replays and recounts
+            // them.
             tracing::info!(
                 "SafeKafkaProducer: moving rd_kafka_destroy to a detached thread \
                  to prevent worker-thread deadlock"
@@ -4077,10 +4080,14 @@ mod tests {
     }
 
     fn unreachable_broker_producer(extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
-        let mut config = test_kafka_config();
         // Port 1 never hosts a broker; producer creation is offline so this
         // still succeeds and everything sent just sits in the local queue.
-        config.brokers = "127.0.0.1:1".to_string();
+        producer_for("127.0.0.1:1", extra_config)
+    }
+
+    fn producer_for(brokers: &str, extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
+        let mut config = test_kafka_config();
+        config.brokers = brokers.to_string();
         let mut builder =
             KafkaSink::build_producer_config(&config, None, None, None, KafkaCompression::None);
         for (key, value) in extra_config {
@@ -4089,6 +4096,58 @@ mod tests {
         builder
             .create_with_context(KafkaProducerContext::new())
             .expect("producer creation does not contact the broker")
+    }
+
+    fn send_with_delivery(
+        producer: &KafkaThreadedProducer,
+        topic: &str,
+        delivery: &Arc<BatchDelivery>,
+    ) {
+        producer
+            .send(BaseRecord::<str, str, _>::with_opaque_to(topic, delivery.clone()).payload("p"))
+            .map_err(|(e, _)| e)
+            .expect("send only queues locally");
+    }
+
+    /// The broker's acks, not the sends, drive the billed count, and every
+    /// callback releases its message's share so the batch's Drop records.
+    #[test]
+    fn delivery_callback_counts_acked_messages_and_releases_batch() {
+        let cluster = rdkafka::mocking::MockCluster::new(1).expect("mock cluster");
+        cluster.create_topic("ack-topic", 1, 1).expect("mock topic");
+        let producer = producer_for(&cluster.bootstrap_servers(), &[]);
+        let delivery = test_delivery();
+        send_with_delivery(&producer, "ack-topic", &delivery);
+        send_with_delivery(&producer, "ack-topic", &delivery);
+
+        producer
+            .flush(Duration::from_secs(10))
+            .expect("mock broker acks");
+
+        assert_eq!(delivery.delivered.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            Arc::strong_count(&delivery),
+            1,
+            "every callback released its clone"
+        );
+        assert!(producer.context().check_error().is_ok());
+    }
+
+    #[test]
+    fn failed_delivery_is_not_counted() {
+        let producer =
+            unreachable_broker_producer(&[("linger.ms", "0"), ("message.timeout.ms", "1")]);
+        let delivery = test_delivery();
+        send_with_delivery(&producer, "fail-topic", &delivery);
+
+        let deadline = StdInstant::now() + StdDuration::from_secs(10);
+        while Arc::strong_count(&delivery) > 1 {
+            assert!(StdInstant::now() < deadline, "delivery callback never ran");
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+
+        assert_eq!(delivery.delivered.load(Ordering::Relaxed), 0);
+        assert!(producer.context().check_error().is_err());
     }
 
     /// Regression: the pre-consume startup
