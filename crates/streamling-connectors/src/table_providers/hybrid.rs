@@ -30,7 +30,7 @@ use streamling_core::side_output::{SourceSideOutput, SupportsSideOutputs};
 use streamling_core::telemetry::provider::{
     metric_key, metric_key_hybrid_src_bounded, metric_key_hybrid_src_unbounded,
 };
-use streamling_core::telemetry::task_wait::TaskWaitMeter;
+use streamling_core::telemetry::task_wait::{ReservedMeter, TaskWaitMeter};
 use streamling_core::topology::{
     HybridBoundedSource, HybridOffsetTable, HybridUnboundedSource, Telemetry,
 };
@@ -1301,13 +1301,13 @@ impl ExecutionPlan for HybridSourceExec {
                 let _current_source = match current_source_result {
                     Ok(source) => source,
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let _ = reserved_meter.send(tx.send(Err(e))).await;
                         break 'outer;
                     }
                 };
 
                 if let Err(e) = provider.snapshot_unbounded_offsets().await {
-                    let _ = tx.send(Err(e)).await;
+                    let _ = reserved_meter.send(tx.send(Err(e))).await;
                     break 'outer;
                 }
 
@@ -1324,7 +1324,7 @@ impl ExecutionPlan for HybridSourceExec {
                 let mut stream = match stream_result {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let _ = reserved_meter.send(tx.send(Err(e))).await;
                         break 'outer;
                     }
                 };
@@ -1363,7 +1363,7 @@ impl ExecutionPlan for HybridSourceExec {
                             {
                                 Ok(b) => b,
                                 Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
+                                    let _ = reserved_meter.send(tx.send(Err(e))).await;
                                     break 'outer;
                                 }
                             };
@@ -1373,7 +1373,7 @@ impl ExecutionPlan for HybridSourceExec {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(e)).await;
+                            let _ = reserved_meter.send(tx.send(Err(e))).await;
                             break 'outer;
                         }
                     }
@@ -1390,6 +1390,7 @@ impl ExecutionPlan for HybridSourceExec {
                     &pending_for_main,
                     &schema_for_synth,
                     &tx,
+                    &reserved_meter,
                     &reference_name_for_spawn,
                 )
                 .await;
@@ -1419,6 +1420,7 @@ impl ExecutionPlan for HybridSourceExec {
                             &pending_for_main,
                             &schema_for_synth,
                             &tx,
+                            &reserved_meter,
                             &reference_name_for_spawn,
                         )
                         .await;
@@ -1442,6 +1444,7 @@ impl ExecutionPlan for HybridSourceExec {
                             &pending_for_main,
                             &schema_for_synth,
                             &tx,
+                            &reserved_meter,
                             &reference_name_for_spawn,
                         )
                         .await;
@@ -1471,6 +1474,7 @@ impl ExecutionPlan for HybridSourceExec {
                                     &pending_for_main,
                                     &schema_for_synth,
                                     &tx,
+                                    &reserved_meter,
                                     &reference_name_for_spawn,
                                 )
                                 .await;
@@ -1489,7 +1493,7 @@ impl ExecutionPlan for HybridSourceExec {
                              The next restart will probe per-phase state for recovery: {:?}",
                             provider.reference_name, e
                         );
-                        let _ = tx.send(Err(e)).await;
+                        let _ = reserved_meter.send(tx.send(Err(e))).await;
                         break 'outer;
                     }
                 }
@@ -1505,6 +1509,7 @@ impl ExecutionPlan for HybridSourceExec {
                 &pending_for_main,
                 &schema_for_synth,
                 &tx,
+                &reserved_meter,
                 &reference_name_for_spawn,
             )
             .await;
@@ -1651,6 +1656,7 @@ async fn emit_terminal_checkpoint(
     pending: &Arc<Mutex<Vec<CheckpointMessage>>>,
     schema_for_synth: &SchemaRef,
     tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
+    meter: &ReservedMeter,
     reference_name: &str,
 ) {
     let terminal = control.begin_terminal_checkpoint();
@@ -1662,7 +1668,7 @@ async fn emit_terminal_checkpoint(
             epoch: terminal.clone(),
             created_at_ms: now_ms(),
         });
-    flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
+    flush_pending_to_synth_batch(pending, schema_for_synth, tx, meter, reference_name).await;
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
     // here does not block their consumption of the marker batch. The wait is
@@ -1699,7 +1705,7 @@ async fn emit_terminal_checkpoint(
         .lock()
         .expect("pending markers mutex poisoned")
         .push(CheckpointMessage::Finalizer(terminal));
-    flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
+    flush_pending_to_synth_batch(pending, schema_for_synth, tx, meter, reference_name).await;
 }
 
 /// Flush any markers currently buffered in `pending` to the downstream
@@ -1719,6 +1725,7 @@ async fn flush_pending_to_synth_batch(
     pending: &Arc<Mutex<Vec<CheckpointMessage>>>,
     schema_for_synth: &SchemaRef,
     tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
+    meter: &ReservedMeter,
     reference_name: &str,
 ) {
     let drained: Vec<CheckpointMessage> = {
@@ -1758,7 +1765,7 @@ async fn flush_pending_to_synth_batch(
         md,
     ));
     let synth = RecordBatch::new_empty(synth_schema);
-    if tx.send(Ok(synth)).await.is_err() {
+    if meter.send(tx.send(Ok(synth))).await.is_err() {
         // Downstream already gone. On teardown paths this is expected; on the
         // terminal-checkpoint path it means the Marker/Finalizer batch was
         // dropped and the epoch will not finalize (at-least-once replay covers
@@ -2019,7 +2026,14 @@ mod tests {
         let schema = create_test_schema();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
 
-        flush_pending_to_synth_batch(&pending, &schema, &tx, "dedup_test").await;
+        flush_pending_to_synth_batch(
+            &pending,
+            &schema,
+            &tx,
+            &ReservedMeter::default(),
+            "dedup_test",
+        )
+        .await;
 
         let batch = rx
             .recv()
@@ -2041,6 +2055,50 @@ mod tests {
             "duplicate Finalizers for one epoch must collapse"
         );
         assert!(pending.lock().unwrap().is_empty(), "pending fully drained");
+    }
+
+    /// A synthetic checkpoint batch is a send along the edge: time waiting on a
+    /// full channel is the node's `blocked`, like any other output send.
+    #[tokio::test]
+    async fn test_flush_pending_send_wait_is_blocked() {
+        use datafusion::prelude::SessionContext;
+        use streamling_core::checkpoints::checkpoint_management::CheckpointEpoch;
+        use streamling_core::telemetry::node_time::NodeTime;
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let recorder = get_metrics_recorder();
+        let blocked = NodeTime::wall(Arc::clone(&recorder), "hybrid::test", "blocked", "down");
+        let (child, _meter) = TaskWaitMeter::install(
+            &SessionContext::new().task_ctx(),
+            recorder,
+            "hybrid::test",
+            Some(Arc::clone(&blocked)),
+        );
+        let meter = TaskWaitMeter::reserve(&child);
+
+        let pending = Arc::new(Mutex::new(vec![CheckpointMessage::Finalizer(
+            CheckpointEpoch(1),
+        )]));
+        let schema = create_test_schema();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Ok(RecordBatch::new_empty(Arc::clone(&schema))))
+            .await
+            .expect("receiver alive");
+
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            rx.recv().await
+        };
+        let ((), _) = tokio::join!(
+            flush_pending_to_synth_batch(&pending, &schema, &tx, &meter, "blocked_test"),
+            drain
+        );
+
+        assert!(
+            blocked.total() >= Duration::from_millis(50),
+            "{:?}",
+            blocked.total()
+        );
     }
 
     async fn create_state_backend(name: &str) -> Arc<dyn StateOperatorBackend<HybridSourceState>> {
