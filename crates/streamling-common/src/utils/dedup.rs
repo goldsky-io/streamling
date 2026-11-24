@@ -1,6 +1,8 @@
 use crate::error::{Result, ResultExt};
 use crate::{streamling_err, streamling_user_err};
-use arrow::array::{ArrayRef, Int64Array, LargeStringArray, StringArray, make_comparator};
+use arrow::array::{
+    ArrayRef, Int64Array, LargeStringArray, StringArray, StringViewArray, make_comparator,
+};
 use arrow::compute::SortOptions;
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -240,9 +242,12 @@ pub fn deduplicate_record_batch_by_version(
                     DataType::LargeUtf8 => {
                         Arc::new(LargeStringArray::from(vec![Some(rule.value.as_str())]))
                     }
+                    DataType::Utf8View => {
+                        Arc::new(StringViewArray::from(vec![Some(rule.value.as_str())]))
+                    }
                     other => {
                         return Err(streamling_user_err!(
-                            "Tombstone column '{}' must be Utf8 or LargeUtf8, got {:?}",
+                            "Tombstone column '{}' must be Utf8, LargeUtf8, or Utf8View, got {:?}",
                             rule.column,
                             other
                         ));
@@ -386,6 +391,9 @@ fn hash_array_value(hasher: &mut impl Hasher, array: &ArrayRef, index: usize) {
             let s = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             hasher.write(s.value(index).as_bytes());
         }
+        DataType::Utf8View => {
+            hasher.write(array.as_string_view().value(index).as_bytes());
+        }
         DataType::Int8 => hasher.write_i8(
             array
                 .as_any()
@@ -488,6 +496,9 @@ fn hash_array_value(hasher: &mut impl Hasher, array: &ArrayRef, index: usize) {
         DataType::LargeBinary => {
             let b = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
             hasher.write(b.value(index));
+        }
+        DataType::BinaryView => {
+            hasher.write(array.as_binary_view().value(index));
         }
         // Anything else (timestamps, decimals, dictionaries, lists, etc.) goes
         // through the display fallback. This loses some hash-quality bits but
@@ -1692,6 +1703,77 @@ mod tests {
             value_col.value(0),
             10,
             "max-version (batch1, value=10) must win"
+        );
+    }
+
+    #[test]
+    fn test_dedup_utf8_view_and_binary_view_keys_and_tombstone() {
+        use arrow::array::{AsArray, BinaryViewArray, LargeBinaryArray};
+
+        // Hash parity: Utf8View hashes identically to Utf8 / LargeUtf8,
+        // and BinaryView hashes identically to Binary / LargeBinary.
+        let hash_one = |arr: &ArrayRef| {
+            let mut h = DefaultHasher::new();
+            hash_array_value(&mut h, arr, 0);
+            h.finish()
+        };
+        let s = "0x1234567890abcdef_longer_than_12_bytes";
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some(s)]));
+        let large_utf8: ArrayRef = Arc::new(LargeStringArray::from(vec![Some(s)]));
+        let utf8_view: ArrayRef = Arc::new(StringViewArray::from(vec![Some(s)]));
+        assert_eq!(hash_one(&utf8), hash_one(&utf8_view));
+        assert_eq!(hash_one(&large_utf8), hash_one(&utf8_view));
+
+        let b = b"0123456789abcdef_longer_than_12_bytes".as_slice();
+        let bin: ArrayRef = Arc::new(BinaryArray::from_opt_vec(vec![Some(b)]));
+        let large_bin: ArrayRef = Arc::new(LargeBinaryArray::from_opt_vec(vec![Some(b)]));
+        let bin_view: ArrayRef = Arc::new(BinaryViewArray::from_iter(vec![Some(b)]));
+        assert_eq!(hash_one(&bin), hash_one(&bin_view));
+        assert_eq!(hash_one(&large_bin), hash_one(&bin_view));
+
+        // End-to-end versioned dedup with Utf8View primary key, BinaryView payload,
+        // and Utf8View tombstone column.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8View, false),
+            Field::new("payload", DataType::BinaryView, false),
+            Field::new("ver", DataType::Int64, false),
+            Field::new("_gs_op", DataType::Utf8View, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringViewArray::from(vec![
+                    "key_a_out_of_line_value",
+                    "key_a_out_of_line_value",
+                    "key_b_out_of_line_value",
+                    "key_b_out_of_line_value",
+                ])),
+                Arc::new(BinaryViewArray::from_iter_values([
+                    b"v1_payload_bytes".as_slice(),
+                    b"v2_payload_bytes".as_slice(),
+                    b"b_live_payload__".as_slice(),
+                    b"b_dead_payload__".as_slice(),
+                ])),
+                Arc::new(Int64Array::from(vec![1, 2, 1, 2])),
+                Arc::new(StringViewArray::from(vec!["i", "u", "i", "d"])),
+            ],
+        )
+        .unwrap();
+
+        let tombstone = TombstoneRule {
+            column: "_gs_op".to_string(),
+            value: "d".to_string(),
+        };
+        let deduped =
+            deduplicate_record_batch_by_version(&batch, "id", "ver", Some(&tombstone)).unwrap();
+        assert_eq!(deduped.num_rows(), 1);
+        assert_eq!(
+            deduped.column(0).as_string_view().value(0),
+            "key_a_out_of_line_value"
+        );
+        assert_eq!(
+            deduped.column(1).as_binary_view().value(0),
+            b"v2_payload_bytes"
         );
     }
 }

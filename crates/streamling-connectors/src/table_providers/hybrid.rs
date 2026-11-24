@@ -574,6 +574,8 @@ impl HybridTableProvider {
         }
 
         match (bounded_type, unbounded_type) {
+            (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+            | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => true,
             // Nested field names can differ (for example "item" vs "element"):
             // Arrow/DataFusion producers label list children differently even
             // when the list semantics are identical.
@@ -2242,6 +2244,152 @@ mod tests {
             &list(true),
             &list(false)
         ));
+    }
+
+    #[test]
+    fn string_and_binary_bounded_types_back_view_unbounded_types() {
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeUtf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Binary,
+            &DataType::BinaryView
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeBinary,
+            &DataType::BinaryView
+        ));
+        // Nested view target under a list is also compatible.
+        let bounded_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let unbounded_list =
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true)));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &bounded_list,
+            &unbounded_list
+        ));
+        // Reverse direction is not implicitly widened.
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8View,
+            &DataType::Utf8
+        ));
+    }
+
+    #[test]
+    fn hybrid_bounded_batch_normalizes_string_and_binary_to_view() {
+        use arrow::array::{
+            Array, AsArray, BinaryArray, FixedSizeListArray, Int64Array, LargeStringArray,
+            ListBuilder, StringArray, StringBuilder,
+        };
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder
+            .values()
+            .append_value("long_nested_topic_value");
+        list_builder.append(true);
+        list_builder.append_null();
+
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            Arc::new(StringArray::from(vec![
+                Some("fixed_slot_0_long"),
+                Some("fixed_slot_1_long"),
+                None,
+                None,
+            ])),
+            None,
+        )
+        .unwrap();
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("raw", DataType::Binary, true),
+            Field::new("input", DataType::LargeUtf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 2),
+                true,
+            ),
+            Field::new("extra", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"0123456789abcdef".as_slice()),
+                    None,
+                ])),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("0x1234567890abcdef1234567890abcdef"),
+                    None,
+                ])),
+                Arc::new(list_builder.finish()),
+                Arc::new(fsl),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("element", DataType::Utf8View, true)),
+                    2,
+                ),
+                true,
+            ),
+        ]));
+
+        // Exercises the exact two-step path HybridSourceExec runs on every batch.
+        let aligned = align_batch_to_schema(&batch, &target_schema).unwrap();
+        let normalized =
+            ClickHouseClient::normalize_batch_from_clickhouse(&aligned, &target_schema).unwrap();
+
+        assert_eq!(normalized.schema(), target_schema);
+        assert_eq!(
+            normalized.column(0).as_string_view().value(0),
+            "0x1234567890abcdef1234567890abcdef"
+        );
+        assert!(normalized.column(0).is_null(1));
+        assert_eq!(
+            normalized.column(1).as_binary_view().value(0),
+            b"0123456789abcdef"
+        );
+        assert!(normalized.column(1).is_null(1));
+
+        let aligned_list = normalized.column(2).as_list::<i32>();
+        assert_eq!(
+            aligned_list.values().as_string_view().value(0),
+            "long_nested_topic_value"
+        );
+        assert!(aligned_list.is_null(1));
+
+        let aligned_pair = normalized.column(3).as_fixed_size_list();
+        assert_eq!(
+            aligned_pair.values().as_string_view().value(0),
+            "fixed_slot_0_long"
+        );
+        assert_eq!(
+            aligned_pair.values().as_string_view().value(1),
+            "fixed_slot_1_long"
+        );
     }
 
     #[test]
