@@ -103,6 +103,68 @@ impl PrometheusResource {
         )
     }
 
+    /// Build a query for the node-wait counter's `blocked` state filtered by
+    /// producer `id`. A producer emits one blocked series per outgoing edge (one
+    /// `downstream_id` each), so wrap this in `sum(...)` to get the node's total
+    /// blocked time (i.e. backpressure from downstream).
+    pub fn backpressure_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
+        Self::build_node_wait_query("blocked", &[("id", node_id)], instance_id)
+    }
+
+    /// Build a query for the node-wait counter's `blocked` state filtered by the
+    /// downstream node it is attributed to (total ms a producer was held back by
+    /// that specific consumer, whether via suspension or a full fan-out channel).
+    pub fn backpressure_by_downstream_query(
+        downstream_id: &str,
+        instance_id: Option<&str>,
+    ) -> String {
+        Self::build_node_wait_query("blocked", &[("downstream_id", downstream_id)], instance_id)
+    }
+
+    /// Build a query for one `producer -> consumer` blocked edge.
+    pub fn blocked_edge_query(
+        node_id: &str,
+        downstream_id: &str,
+        instance_id: Option<&str>,
+    ) -> String {
+        Self::build_node_wait_query(
+            "blocked",
+            &[("id", node_id), ("downstream_id", downstream_id)],
+            instance_id,
+        )
+    }
+
+    /// Build a query for the node-wait counter's `starved` state (time a node
+    /// waited for input) filtered by node `id`.
+    pub fn starved_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
+        Self::build_node_wait_query("starved", &[("id", node_id)], instance_id)
+    }
+
+    /// Build a query for the node-wait counter's `busy` state (the node's own
+    /// work) filtered by node `id`.
+    pub fn busy_by_id_query(node_id: &str, instance_id: Option<&str>) -> String {
+        Self::build_node_wait_query("busy", &[("id", node_id)], instance_id)
+    }
+
+    /// Build `streamling_node_wait_milliseconds_total{state="<state>",<labels>[,instance="..."]}`.
+    /// `instance_id` is the run's `instance` label (the test context's
+    /// `test_id`), so a query sees only its own run. All values are trusted
+    /// Prometheus label values and must not contain unescaped quote characters.
+    fn build_node_wait_query(
+        state: &str,
+        labels: &[(&str, &str)],
+        instance_id: Option<&str>,
+    ) -> String {
+        let mut selector = format!("state=\"{state}\"");
+        for (key, value) in labels {
+            selector.push_str(&format!(",{key}=\"{value}\""));
+        }
+        if let Some(instance) = instance_id {
+            selector.push_str(&format!(",instance=\"{instance}\""));
+        }
+        format!("streamling_node_wait_milliseconds_total{{{selector}}}")
+    }
+
     /// Build a query for a checkpoint coordinator metric (counter total).
     /// Coordinator metrics use `id="checkpoint_coordinator"`.
     pub fn checkpoint_coordinator_query(metric_name: &str, instance_id: Option<&str>) -> String {
@@ -121,11 +183,25 @@ impl PrometheusResource {
     /// Build a metric query with labels
     /// Note: instance_id maps to the `instance` label in Prometheus (from OTLP resource attribute)
     fn build_metric_query(metric_name: &str, node_id: &str, instance_id: Option<&str>) -> String {
-        let mut labels = format!("id=\"{}\"", node_id);
+        Self::build_metric_query_by_label(metric_name, "id", node_id, instance_id)
+    }
+
+    /// Build `metric{label_key="label_value"[,instance="..."]}`. Centralizes the
+    /// PromQL label-selector construction so callers (whether matching on `id`,
+    /// `downstream_id`, etc.) don't hand-assemble selector strings.
+    /// `label_key`, `label_value`, and `instance_id` are trusted Prometheus label
+    /// fragments/values and must not contain unescaped quote characters.
+    fn build_metric_query_by_label(
+        metric_name: &str,
+        label_key: &str,
+        label_value: &str,
+        instance_id: Option<&str>,
+    ) -> String {
+        let mut labels = format!("{label_key}=\"{label_value}\"");
         if let Some(instance) = instance_id {
-            labels.push_str(&format!(",instance=\"{}\"", instance));
+            labels.push_str(&format!(",instance=\"{instance}\""));
         }
-        format!("{}{{{}}}", metric_name, labels)
+        format!("{metric_name}{{{labels}}}")
     }
 
     /// Wait for a metric to reach at least a certain value

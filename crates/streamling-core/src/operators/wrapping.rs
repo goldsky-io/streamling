@@ -8,8 +8,11 @@ use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, Share
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
+use crate::telemetry::node_time::{BankedCount, NodeTime, OwnWork};
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
+use crate::telemetry::task_wait::TaskWaitMeter;
 use crate::telemetry::types::RowCountMeasurementType;
+use crate::telemetry::wake_timed::WakeTimed;
 use crate::topology::Telemetry;
 use crate::utils::dedup::deduplicate_record_batch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
@@ -34,7 +37,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use delegate::delegate;
-use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Debug;
@@ -194,6 +196,9 @@ pub struct WrappingSourceTableProvider {
     /// `WrappingExec` constructed for this source so the running watermark
     /// state is not duplicated.
     event_time_instrumentation: Option<EventTimeInstrumentation>,
+    /// The node the rows entering this source count as input for: the source itself, a
+    /// hybrid source for its phases, or `None` for a hybrid source, whose phases count them.
+    input_rows_id: Option<String>,
 }
 
 impl WrappingSourceTableProvider {
@@ -205,11 +210,19 @@ impl WrappingSourceTableProvider {
     ) -> Self {
         Self {
             inner,
-            reference_name,
             side_outputs: Arc::new(RwLock::new(Vec::new())),
             scan_sharing_registry,
             event_time_instrumentation: EventTimeInstrumentation::from_telemetry(telemetry),
+            input_rows_id: Some(reference_name.clone()),
+            reference_name,
         }
+    }
+
+    /// Count the rows entering this source as input of `id` instead of this source: a
+    /// hybrid phase counts for its hybrid source. `None`: the source counts no input rows.
+    pub fn with_input_rows_id(mut self, id: Option<String>) -> Self {
+        self.input_rows_id = id;
+        self
     }
 
     pub fn get_inner(&self) -> Arc<dyn TableProvider> {
@@ -229,17 +242,27 @@ impl WrappingSourceTableProvider {
     /// accurate lag calculations even when a source-level filter is configured. Same
     /// rationale applies to event-time instrumentation: the `WrappingExec` sits below
     /// the source filter so freshness metrics see the pre-filter row stream.
+    ///
+    /// `suppress_backpressure` marks the `WrappingExec` as a
+    /// [`BackpressureRole::FanOutProducer`] — set it for a scan-shared source,
+    /// which is stashed in `SharedSourceHandle` before the optimizer runs (so
+    /// the attribution rule can't reach it) and whose per-edge backpressure is
+    /// emitted by the `BroadcastStream` instead.
     fn wrap_with_side_outputs_before_filter(
         inner_exec: Arc<dyn ExecutionPlan>,
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
+        input_rows_id: Option<String>,
+        suppress_backpressure: bool,
     ) -> Arc<dyn ExecutionPlan> {
         let below_filter = Self::wrap_below_filter(
             inner_exec,
             reference_name,
             side_outputs,
             event_time_instrumentation,
+            input_rows_id,
+            suppress_backpressure,
         );
         // The rows the source node outputs, after its filter: what downstream nodes receive.
         Arc::new(
@@ -254,12 +277,37 @@ impl WrappingSourceTableProvider {
         )
     }
 
+    /// The source's `SourceInput` wrapper measures its `node_wait` states, so it
+    /// carries the fan-out stamp.
     fn wrap_below_filter(
         inner_exec: Arc<dyn ExecutionPlan>,
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
+        input_rows_id: Option<String>,
+        suppress_backpressure: bool,
     ) -> Arc<dyn ExecutionPlan> {
+        let source_input = |inner: Arc<dyn ExecutionPlan>,
+                            side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+                            instrumentation: Option<EventTimeInstrumentation>|
+         -> Arc<dyn ExecutionPlan> {
+            let exec = WrappingExec::new(
+                inner,
+                reference_name.to_string(),
+                side_outputs,
+                Vec::new(),
+                instrumentation,
+            )
+            .with_role(WrappingRole::SourceInput {
+                input_rows_id: input_rows_id.clone(),
+            });
+            Arc::new(if suppress_backpressure {
+                exec.suppress_backpressure()
+            } else {
+                exec
+            })
+        };
+
         // A pushed-down scan projection may sit above the source filter (the
         // filter plans against the full payload schema and the projection is
         // re-applied above it — see the Kafka source). See through the
@@ -272,15 +320,10 @@ impl WrappingSourceTableProvider {
                 .downcast_ref::<StreamingFilterExec>()
         {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
-                WrappingExec::new(
-                    source_exec,
-                    reference_name.to_string(),
-                    side_outputs.clone(),
-                    Vec::new(),
-                    event_time_instrumentation.clone(),
-                )
-                .with_role(WrappingRole::SourceInput),
+            let wrapped_source = source_input(
+                source_exec,
+                side_outputs.clone(),
+                event_time_instrumentation.clone(),
             );
             // Mark the re-applied filter/projection as source-owned: they sit
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
@@ -307,15 +350,10 @@ impl WrappingSourceTableProvider {
 
         if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
-                WrappingExec::new(
-                    source_exec,
-                    reference_name.to_string(),
-                    side_outputs.clone(),
-                    Vec::new(),
-                    event_time_instrumentation.clone(),
-                )
-                .with_role(WrappingRole::SourceInput),
+            let wrapped_source = source_input(
+                source_exec,
+                side_outputs.clone(),
+                event_time_instrumentation.clone(),
             );
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
@@ -330,29 +368,11 @@ impl WrappingSourceTableProvider {
                          Falling back to wrapping the filtered plan.",
                         reference_name, e
                     );
-                    Arc::new(
-                        WrappingExec::new(
-                            inner_exec,
-                            reference_name.to_string(),
-                            side_outputs,
-                            Vec::new(),
-                            event_time_instrumentation,
-                        )
-                        .with_role(WrappingRole::SourceInput),
-                    )
+                    source_input(inner_exec, side_outputs, event_time_instrumentation)
                 }
             }
         } else {
-            Arc::new(
-                WrappingExec::new(
-                    inner_exec,
-                    reference_name.to_string(),
-                    side_outputs,
-                    Vec::new(),
-                    event_time_instrumentation,
-                )
-                .with_role(WrappingRole::SourceInput),
-            )
+            source_input(inner_exec, side_outputs, event_time_instrumentation)
         }
     }
 }
@@ -437,12 +457,27 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // Scan-shared source: stashed as the SharedSourceHandle's base_exec
+            // before the optimizer runs, so unreachable by the attribution rule.
+            // Suppress its own emission — the BroadcastStream emits one per-edge
+            // series per consumer instead.
             let wrapped_exec = Self::wrap_with_side_outputs_before_filter(
                 inner_exec,
                 &reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                self.input_rows_id.clone(),
+                true,
             );
+
+            // This sub-plan is stashed in the SharedSourceHandle below and is
+            // unreachable by the main DownstreamAttributionRule pass. Attribute
+            // its upstream edges now (e.g. source -> this producer) so they carry
+            // a `downstream_id` instead of emitting an untagged `blocked` series;
+            // the producer's own WrappingExec stays suppressed (its per-consumer
+            // edges are emitted by the BroadcastStream).
+            let wrapped_exec =
+                crate::optimizer::attribute_scan_shared_producer_base_exec(wrapped_exec)?;
 
             // Get internal_buffer_size from Session config
             let internal_buffer_size =
@@ -463,6 +498,7 @@ impl TableProvider for WrappingSourceTableProvider {
                         wrapped_exec,
                         internal_buffer_size,
                         expected_count,
+                        Some(Arc::from(reference_name.as_str())),
                         registry.scope(),
                     ));
                     sources.insert(reference_name.clone(), handle.clone());
@@ -484,11 +520,15 @@ impl TableProvider for WrappingSourceTableProvider {
                 .map(|g| g.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // No scan sharing: single linear downstream — the optimizer rule
+            // stamps Edge(downstream_id), so don't suppress here.
             Ok(Self::wrap_with_side_outputs_before_filter(
                 inner_exec,
                 &self.reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                self.input_rows_id.clone(),
+                false,
             ))
         }
     }
@@ -507,9 +547,48 @@ impl TableProvider for WrappingSourceTableProvider {
     }
 }
 
+/// What a `WrappingExec` measures for its topology node.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WrappingRole {
+    /// A transform: its output rows, plus compute, checkpoint and live-inspect telemetry.
+    Node,
+    /// Directly above a source's connector, below its filter: the rows pulled in count as
+    /// input of `input_rows_id` (none when the phases of a hybrid source count them), and
+    /// side outputs and event-time freshness observe every row.
+    SourceInput { input_rows_id: Option<String> },
+    /// The top of a source's plan, above its filter: the rows the source outputs.
+    SourceOutput,
+}
+
+/// How this node's `node_wait{state="blocked"}` (yield->resume suspension, or
+/// a claiming task operator's output send wait) is attributed. Stamped by the `DownstreamAttributionRule` pass (and, for
+/// scan-sharing producers, at construction). Only `blocked` consults this;
+/// `starved` is node-local and always emits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BackpressureRole {
+    /// Single named downstream consumer -> `downstream_id=<plain name>`. Stored
+    /// as the *plain* name (metric_key prefix stripped) so it joins the
+    /// downstream's `id` tag.
+    Edge(String),
+    /// Downstream unresolved (rare) -> `downstream_id=""`. Still one series, with
+    /// a label key set identical to the attributed case.
+    #[default]
+    Unattributed,
+    /// Feeds a `BroadcastStream` fan-out (multi-sink or scan sharing). Don't emit
+    /// `blocked` here — the broadcast emits one per-edge series per consumer;
+    /// emitting the aggregate too would double count.
+    ///
+    /// Invariant: the two blocked-emission layers must never coexist for the
+    /// same node. Only stamp this (via [`WrappingExec::suppress_backpressure`])
+    /// on a node that actually feeds a `BroadcastStream`; using it on a non-
+    /// fan-out node would silently swallow that node's `blocked` series with no
+    /// per-edge emitter to replace it.
+    FanOutProducer,
+}
+
 /// Wrapper around `ExecutionPlan` that injects additional functionality like telemetry related
 /// attributes and dynamic tables
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WrappingExec {
     inner: Arc<dyn ExecutionPlan>,
     reference_name: String,
@@ -522,19 +601,9 @@ pub struct WrappingExec {
     /// optimizer rewrites.
     event_time_instrumentation: Option<EventTimeInstrumentation>,
     role: WrappingRole,
-}
-
-/// What a `WrappingExec` measures for its topology node.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WrappingRole {
-    /// A transform: its output rows, plus compute, checkpoint and live-inspect telemetry.
-    Node,
-    /// Directly above a source's connector, below its filter: side outputs, event-time
-    /// freshness and compute observe every row pulled in. Rows are not counted here.
-    SourceInput,
-    /// The top of a source's plan, above its filter: the rows the source outputs, which
-    /// downstream nodes count as their input.
-    SourceOutput,
+    /// Downstream-attribution role for `node_wait{state="blocked"}`. Defaults to
+    /// `Unattributed`; the optimizer rule stamps `Edge`/`FanOutProducer`.
+    backpressure_role: BackpressureRole,
 }
 
 impl crate::operators::TopologyBoundary for WrappingExec {
@@ -585,6 +654,7 @@ impl WrappingExec {
             adjusted_schema,
             event_time_instrumentation,
             role: WrappingRole::Node,
+            backpressure_role: BackpressureRole::Unattributed,
         }
     }
 
@@ -592,15 +662,63 @@ impl WrappingExec {
         self.role = role;
         self
     }
-}
 
-/// Wall-clock around `data.next().await` is idle-wait dominated. SQL nodes
-/// that already expose a DataFusion subtree emit per-batch compute via
-/// `record_execution_plan_metrics`; recording wall-clock too would fold
-/// idle-wait into the same `elapsed_compute` series. A passthrough SQL
-/// node with no subtree metrics keeps wall-clock as the only signal.
-fn should_record_wall_clock_compute(has_subtree_metrics: bool, is_sql_node: bool) -> bool {
-    !has_subtree_metrics || !is_sql_node
+    pub fn role(&self) -> &WrappingRole {
+        &self.role
+    }
+
+    /// The node's `reference_name` (metric_key form `"{app}::{name}"`). The
+    /// `DownstreamAttributionRule` uses it to name the downstream for children;
+    /// strip with `get_reference_name_from_metric_key` before using as a tag.
+    pub fn reference_name(&self) -> &str {
+        &self.reference_name
+    }
+
+    /// This node's backpressure attribution role.
+    pub fn backpressure_role(&self) -> &BackpressureRole {
+        &self.backpressure_role
+    }
+
+    /// Stamp a single named downstream consumer. `downstream_id` must be the
+    /// *plain* node name (not metric_key form) so it joins the downstream's `id`.
+    pub fn with_downstream_id(mut self, downstream_id: String) -> Self {
+        self.backpressure_role = BackpressureRole::Edge(downstream_id);
+        self
+    }
+
+    /// Stamp this node as a fan-out producer, suppressing its own `blocked`
+    /// emission (the `BroadcastStream` emits per-edge instead). Only call this on
+    /// a node that genuinely feeds a `BroadcastStream`; see the invariant on
+    /// [`BackpressureRole::FanOutProducer`].
+    pub fn suppress_backpressure(mut self) -> Self {
+        self.backpressure_role = BackpressureRole::FanOutProducer;
+        self
+    }
+
+    /// The immediate wrapped plan. `children()` is *see-through* (it delegates to
+    /// `inner`, exposing `inner`'s children rather than `inner` itself), so the
+    /// `DownstreamAttributionRule` must use this accessor to recurse into `inner`
+    /// directly — otherwise an adjacent `WrappingExec` (e.g. an elided-identity
+    /// transform sitting directly on its source) would be skipped and never
+    /// stamped.
+    pub fn inner(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.inner
+    }
+
+    /// Clone this node with a different `backpressure_role` **and** a new `inner`.
+    /// Attribution preserves schema/partitioning, so the cached `adjusted_schema`
+    /// carries over unchanged. Used by the attribution rule to rebuild after
+    /// recursing into `inner` (see `inner`).
+    pub fn clone_with_role_and_inner(
+        &self,
+        role: BackpressureRole,
+        inner: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.backpressure_role = role;
+        cloned.inner = inner;
+        cloned
+    }
 }
 
 /// Used to intercept `execute()` calls and run additional logic like telemetry processing
@@ -644,16 +762,18 @@ impl ExecutionPlan for WrappingExec {
         // SAME watermark state Arc — without this, DataFusion optimizer
         // rewrites would silently start a fresh watermark for every
         // reconstruction.
-        Ok(Arc::new(
-            WrappingExec::new(
-                new_inner,
-                self.reference_name.clone(),
-                self.side_outputs.clone(),
-                self.forced_non_null_columns.clone(),
-                self.event_time_instrumentation.clone(),
-            )
-            .with_role(self.role),
-        ))
+        let mut rebuilt = WrappingExec::new(
+            new_inner,
+            self.reference_name.clone(),
+            self.side_outputs.clone(),
+            self.forced_non_null_columns.clone(),
+            self.event_time_instrumentation.clone(),
+        )
+        .with_role(self.role.clone());
+        // Preserve the downstream-attribution role across reconstructions so an
+        // optimizer rewrite after the attribution pass cannot drop the stamp.
+        rebuilt.backpressure_role = self.backpressure_role.clone();
+        Ok(Arc::new(rebuilt))
     }
 
     fn execute(
@@ -672,11 +792,48 @@ impl ExecutionPlan for WrappingExec {
             metric_metadata_id
         );
 
-        let mut data = execute_input_stream(
+        // An inner operator that runs its loop in a spawned task claims this
+        // meter, so its own work is not mistaken for `starved` (see
+        // `TaskWaitMeter`). An inner phase of a node that reserved its meter
+        // (hybrid source) shares that meter and reports no `node_wait` of its
+        // own: its output feeds the enclosing node, not a topology edge.
+        // One `blocked` emitter per edge: a fan-out producer's
+        // `BroadcastStream` emits per consumer instead.
+        let role = self.role.clone();
+        // A source's `SourceOutput` wrapper above its filter only counts rows: the
+        // `SourceInput` wrapper below it measures the node's time.
+        let measures_node_time = role != WrappingRole::SourceOutput;
+        let edge_blocked = |downstream_id: &str| {
+            NodeTime::wall(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "blocked",
+                downstream_id,
+            )
+        };
+        let (inner_context, task_wait, blocked_time) = match TaskWaitMeter::reserved(&context) {
+            Some(meter) => (context, meter, None),
+            None => {
+                let blocked_time = match &self.backpressure_role {
+                    _ if !measures_node_time => None,
+                    BackpressureRole::Edge(downstream_id) => Some(edge_blocked(downstream_id)),
+                    BackpressureRole::Unattributed => Some(edge_blocked("")),
+                    BackpressureRole::FanOutProducer => None,
+                };
+                let (inner_context, meter) = TaskWaitMeter::install(
+                    &context,
+                    Arc::clone(&metrics_recorder),
+                    &metric_metadata_id,
+                    blocked_time.clone(),
+                );
+                (inner_context, meter, blocked_time)
+            }
+        };
+        let data = execute_input_stream(
             Arc::clone(&self.inner),
             Arc::clone(&self.schema()),
             partition,
-            Arc::clone(&context),
+            inner_context,
         )?;
 
         // Read the input's metrics AFTER `execute_input_stream` has run: a
@@ -684,38 +841,96 @@ impl ExecutionPlan for WrappingExec {
         // (`elapsed_compute`, ...) when its `execute` is called. Snapshotting
         // before that returned an empty set whose live Arc-backed counters were
         // never captured, so a SQL transform's compute never reached
-        // `elapsed_compute`. The `MetricsSet` holds Arc-shared counters, so
+        // `elapsed_compute` or `busy`. The `MetricsSet` holds Arc-shared counters, so
         // this single read stays live as batches flow.
         let metrics = self.metrics();
 
-        // Static per node: resolve once per stream, not per batch. SQL
-        // transforms get accurate per-batch compute from the DataFusion
-        // subtree delta; the wall-clock span below is measured around
-        // `data.next().await` (dominated by upstream idle-wait) and would
-        // pollute the same `elapsed_compute` series for them. When the
-        // subtree exposes NO metrics at all (e.g. a passthrough transform
-        // whose input is directly the upstream topology boundary), the delta
-        // path can never emit, so wall-clock stays on as the only available
-        // signal rather than leaving the series dead.
-        let role = self.role;
-        // The output counter above a source's filter only counts rows: the input wrapper
-        // below it already records this node's compute and checkpoint telemetry.
-        let record_wall_clock_compute = role != WrappingRole::SourceOutput
-            && should_record_wall_clock_compute(
-                metrics.is_some(),
-                metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
-            );
-
+        // Static per node: resolve once per stream, not per batch. A SQL
+        // transform's own work is its DataFusion subtree compute. A
+        // passthrough transform with no subtree metrics has none to measure.
+        let is_sql_node = metrics_recorder.resolve_is_sql_node(&metric_metadata_id);
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
+
+        // `node_wait` series of this stream. A task-decoupled inner operator
+        // claimed the meter in its `execute`, so the meter reports `starved`
+        // and `busy`. Otherwise `starved` is this wrapper's input poll; for a
+        // SQL transform it waits on the subtree's compute in the forwarder
+        // task, so that compute is `busy`, not `starved`.
+        let task_claimed = task_wait.is_claimed();
+        let own_work = metrics
+            .as_ref()
+            .filter(|_| is_sql_node)
+            .map(|metrics| OwnWork::new(metrics.clone(), partition));
+        let has_own_work = own_work.is_some();
+        let starved_time = (measures_node_time && !task_claimed).then(|| match &own_work {
+            Some(work) => NodeTime::wall_excluding(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "starved",
+                work.clone(),
+            ),
+            None => NodeTime::wall(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "starved",
+                "",
+            ),
+        });
+        if has_own_work && let Some(starved) = &starved_time {
+            task_wait.time_subtree_polls(Arc::clone(starved));
+        }
+        let busy_time = own_work
+            .filter(|_| measures_node_time && !task_claimed)
+            .map(|work| {
+                NodeTime::work(
+                    Arc::clone(&metrics_recorder),
+                    &metric_metadata_id,
+                    "busy",
+                    work,
+                )
+            });
+        // A task operator times `blocked` as its output send wait; otherwise
+        // it is this wrapper's yield->resume.
+        let (blocked_time, task_blocked) = if task_claimed {
+            (None, blocked_time)
+        } else {
+            (blocked_time, None)
+        };
+
+        let mut input = WakeTimed::new(data, starved_time.clone(), blocked_time.clone());
+        let empty_batches = BankedCount::new(
+            Arc::clone(&metrics_recorder),
+            "node_empty_batches",
+            &metric_metadata_id,
+        );
 
         let schema = self.schema();
 
         let measured_stream = async_stream::stream! {
+            // Lives as long as the stream: it accrues without spans.
+            let _busy_time = busy_time;
             loop {
-                let batch_start = Instant::now();
-                let batch_result = data.next().await;
-                let batch_elapsed = batch_start.elapsed();
+                // Resume point: the downstream asked for the next batch. Kept even
+                // when that poll turns out to be EOF: the downstream spent the gap
+                // on our last batch, unlike `starved`'s EOF wait (teardown).
+                if let Some(blocked_time) = &blocked_time {
+                    blocked_time.close();
+                }
+
+                // A downstream that polls again only after our input is
+                // ready holds us back from that wake: `blocked`.
+                let poll_start = Instant::now();
+                let batch_result = input.next().await;
+
+                // `elapsed_compute` is this wrapper's poll time per delivered
+                // batch, as on `main`, unless the node is a SQL transform with
+                // subtree metrics: its observation is that compute alone.
+                // TODO(node-wait stage 3, STRM-6760): delete once dashboards
+                // read `node_wait{state="busy"}` and a batch counter.
+                if measures_node_time && !has_own_work && matches!(batch_result, Some(Ok(_))) {
+                    metrics_recorder.record_elapsed_compute(poll_start.elapsed(), &metric_metadata_id);
+                }
 
                 let batch_result = match batch_result {
                     Some(r) => r,
@@ -724,20 +939,31 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
-                        // Record per-batch compute time (non-sql nodes only;
-                        // see `record_wall_clock_compute` above)
-                        if record_wall_clock_compute {
-                            metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
+                        // Our own work on the batch holds the task's send
+                        // back, not the downstream: in no state.
+                        if let Some(task_blocked) = &task_blocked {
+                            task_blocked.pause();
                         }
-
                         // Process telemetry
-                        if role != WrappingRole::SourceInput {
-                            metrics_recorder.record_execution_plan_metrics(
-                                metric_metadata_id.as_str(),
-                                batch.num_rows(),
-                                RowCountMeasurementType::OutputRowCount,
-                                metrics.as_ref(),
-                            );
+                        match &role {
+                            WrappingRole::Node | WrappingRole::SourceOutput => {
+                                metrics_recorder.record_execution_plan_metrics(
+                                    metric_metadata_id.as_str(),
+                                    &batch,
+                                    RowCountMeasurementType::OutputRowCount,
+                                    metrics.as_ref(),
+                                );
+                            }
+                            WrappingRole::SourceInput { input_rows_id } => {
+                                if let Some(input_rows_id) = input_rows_id {
+                                    metrics_recorder.record_execution_plan_metrics(
+                                        input_rows_id.as_str(),
+                                        &batch,
+                                        RowCountMeasurementType::SourceInputRowCount,
+                                        None,
+                                    );
+                                }
+                            }
                         }
                         if role == WrappingRole::SourceOutput {
                             yield Ok(batch);
@@ -746,6 +972,9 @@ impl ExecutionPlan for WrappingExec {
 
                         // Record checkpoint marker arrival time for transforms
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
+                        // A zero-row batch that carries checkpoint messages is
+                        // control traffic; only an empty *data* batch counts.
+                        empty_batches.add(u64::from(batch.num_rows() == 0 && checkpoint_messages.is_empty()));
                         for message in &checkpoint_messages {
                             if let CheckpointMessage::Marker { created_at_ms, .. } = message {
                                 let arrival_latency_ms = now_ms().saturating_sub(*created_at_ms);
@@ -786,10 +1015,18 @@ impl ExecutionPlan for WrappingExec {
 
                         live_data_inspect.process(metric_metadata_id.as_str(), &batch).await;
 
+                        if let Some(task_blocked) = &task_blocked {
+                            task_blocked.resume();
+                        }
+                        // Until the downstream asks again, this node is blocked.
+                        if let Some(blocked_time) = &blocked_time {
+                            blocked_time.open();
+                        }
                         yield Ok(batch);
                     }
                     Err(e) => {
                         debug!("WrappingExec [{}]: Error from input stream, stream will terminate: {}", metric_metadata_id, e);
+                        // A terminal error yield is not blocked time.
                         yield Err(e);
                         return;
                     }
@@ -852,6 +1089,14 @@ impl WrappingDataSink {
             event_time_instrumentation: EventTimeInstrumentation::from_telemetry(telemetry),
         }
     }
+
+    /// The sink's `reference_name` (metric_key form `"{app}::{name}"`). The
+    /// `DownstreamAttributionRule` recovers it from a root `DataSinkExec` to name
+    /// the topmost transform's downstream; strip via
+    /// `get_reference_name_from_metric_key` before using as a tag.
+    pub fn reference_name(&self) -> &str {
+        &self.reference_name
+    }
 }
 
 #[async_trait]
@@ -865,24 +1110,55 @@ impl DataSink for WrappingDataSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let metric_metadata_id = self.reference_name.clone();
+        let schema = data.schema();
         let metrics = self.metrics();
         let metrics_recorder = get_metrics_recorder().clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
 
-        let schema = data.schema();
         let primary_key = self.primary_key.clone();
 
+        // `starved`: the sink waiting on upstream, measured like
+        // `WrappingExec`'s. `busy`: the sink holding a delivered batch until it
+        // asks for the next one (connector write, and backpressure from the
+        // destination). Neither feeds `elapsed_compute`: a sink's is
+        // connector-recorded service time.
+        let starved_time = NodeTime::wall(
+            Arc::clone(&metrics_recorder),
+            &metric_metadata_id,
+            "starved",
+            "",
+        );
+        let busy_time = NodeTime::wall(
+            Arc::clone(&metrics_recorder),
+            &metric_metadata_id,
+            "busy",
+            "",
+        );
+
+        // A prefetching connector (`ready_chunks`) polls, gets `Pending`, and
+        // writes before it polls again: from the input's wake on, that time is
+        // its own.
+        let mut input = WakeTimed::new(data, Some(starved_time), Some(Arc::clone(&busy_time)));
+
         let measured_stream = async_stream::stream! {
-            while let Some(batch_result) = data.next().await {
+            loop {
+                busy_time.close();
+                let batch_result = input.next().await;
+                if matches!(batch_result, Some(Ok(_))) {
+                    busy_time.open();
+                }
+                let Some(batch_result) = batch_result else {
+                    break;
+                };
                 match batch_result {
                     Ok(batch) => {
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
                         );
@@ -1127,13 +1403,24 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                     }
                 }
 
-                let exec = Arc::new(WrappingExec::new(
-                    input_physical,
-                    reference_name.clone(),
-                    side_outputs,
-                    wrapping_node.forced_non_null_columns.clone(),
-                    EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
-                ));
+                let exec = {
+                    let wrapping_exec = WrappingExec::new(
+                        input_physical,
+                        reference_name.clone(),
+                        side_outputs,
+                        wrapping_node.forced_non_null_columns.clone(),
+                        EventTimeInstrumentation::from_telemetry(wrapping_node.telemetry.as_ref()),
+                    );
+                    // A scan-shared transform is stashed as a SharedSourceHandle
+                    // base_exec before the optimizer runs (unreachable by the
+                    // rule), so suppress its own emission — the BroadcastStream
+                    // emits one per-edge series per consumer instead.
+                    if wrapping_node.enable_scan_sharing {
+                        Arc::new(wrapping_exec.suppress_backpressure())
+                    } else {
+                        Arc::new(wrapping_exec)
+                    }
+                };
 
                 // Check if we should store this in the scan sharing registry for future reuse
                 if wrapping_node.enable_scan_sharing {
@@ -1150,8 +1437,22 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                             None,
                         )?)))
                     } else {
-                        // Create and store the handle for this transform
-                        let schema = exec.schema();
+                        // Create and store the handle for this transform.
+                        // `exec` (the suppressed producer WrappingExec plus its
+                        // whole upstream sub-plan) is stashed as the handle's
+                        // base_exec BEFORE the DownstreamAttributionRule runs, so
+                        // the main pass can't reach it. Attribute its upstream
+                        // edges now (e.g. `up_source -> this producer`) so they
+                        // carry a `downstream_id` instead of emitting an untagged
+                        // `blocked` series; the producer's own WrappingExec stays
+                        // suppressed (its per-consumer edges come from the
+                        // BroadcastStream). Mirrors the source path in
+                        // `WrappingSourceTableProvider::scan`.
+                        let attributed_exec =
+                            crate::optimizer::attribute_scan_shared_producer_base_exec(
+                                exec.clone(),
+                            )?;
+                        let schema = attributed_exec.schema();
                         let internal_buffer_size =
                             get_streamling_config(session_state)?.internal_buffer_size;
                         let expected_count =
@@ -1159,9 +1460,10 @@ impl ExtensionPlanner for WrappingExtensionPlanner {
                                 .unwrap_or(0);
                         let handle = Arc::new(SharedSourceHandle::new(
                             schema,
-                            exec.clone(),
+                            attributed_exec,
                             internal_buffer_size,
                             expected_count,
+                            Some(Arc::from(reference_name.as_str())),
                             // Transform scan sharing goes through the global
                             // SCAN_SHARING_REGISTRY, which no run loop owns, so
                             // there is no controller scope to thread here yet.
@@ -1200,6 +1502,7 @@ mod tests {
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A shared scan is built once from the first consumer's arguments, so only
@@ -1261,22 +1564,6 @@ mod tests {
             shared.supports_filters_pushdown(&[&filter]).unwrap(),
             vec![TableProviderFilterPushDown::Unsupported]
         );
-    }
-
-    #[test]
-    fn sql_with_subtree_metrics_suppresses_wall_clock() {
-        assert!(!should_record_wall_clock_compute(true, true));
-    }
-
-    #[test]
-    fn sql_passthrough_without_subtree_metrics_keeps_wall_clock() {
-        assert!(should_record_wall_clock_compute(false, true));
-    }
-
-    #[test]
-    fn non_sql_always_records_wall_clock() {
-        assert!(should_record_wall_clock_compute(true, false));
-        assert!(should_record_wall_clock_compute(false, false));
     }
 
     #[derive(Debug)]
@@ -1353,6 +1640,8 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
+            false,
         );
 
         // The source's output counter sits on top, above its filter.
@@ -1400,6 +1689,58 @@ mod tests {
         );
     }
 
+    /// Side outputs at the source wrapper see every pre-filter row, while the
+    /// filter still drops rows above it. The row metrics are covered in
+    /// `recorder::pipeline_io_delta_tests`.
+    #[tokio::test]
+    async fn test_side_outputs_see_rows_before_source_filter() {
+        let schema = test_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>())),
+                Arc::new(Int64Array::from(
+                    (0..10).map(|i| i * 1000).collect::<Vec<i64>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    (0..10).map(|i| i < 3).collect::<Vec<bool>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = FilterExec::try_new(predicate, source_exec).unwrap();
+        let streaming_filter =
+            Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
+
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+        let plan = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            streaming_filter,
+            "test_source",
+            vec![Arc::new(CountingSideOutput {
+                rows_seen: rows_seen.clone(),
+            })],
+            None,
+            Some("test_source".to_string()),
+            false,
+        );
+
+        let output = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let output_rows: usize = output.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows_seen.load(Ordering::Relaxed),
+            10,
+            "pre-filter rows at the source wrapper"
+        );
+        assert_eq!(output_rows, 3, "filter still applied above the wrapper");
+    }
+
     #[test]
     fn test_wrap_with_side_outputs_before_filter_reorders_plan() {
         let schema = test_schema();
@@ -1426,6 +1767,8 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
+            false,
         );
 
         // The source's output counter sits on top, above its filter.
@@ -1479,6 +1822,8 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
+            false,
         );
 
         // Without a filter, the top-level plan should be WrappingExec directly
@@ -1514,6 +1859,8 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
+            false,
         );
 
         let task_ctx = Arc::new(TaskContext::default());
@@ -1710,6 +2057,8 @@ mod tests {
             "test_source",
             Vec::new(),
             Some(inst),
+            Some("test_source".to_string()),
+            false,
         );
 
         // result is StreamingFilterExec → child is WrappingExec with our instrumentation.
@@ -1783,6 +2132,988 @@ mod tests {
         // `true` and the warn-log path is skipped.
         emit_event_time_metrics(&inst, &batch, "test_source", recorder.as_ref());
         assert!(inst.read_error_logged.load(Ordering::Relaxed));
+    }
+
+    /// Drives a `WrappingExec` with a slow consumer so the yield->resume span
+    /// exceeds a millisecond and the `node_wait{state="blocked"}` path runs;
+    /// guards that the instrumented loop still delivers every row without
+    /// panicking or hanging. Uses an *unregistered* node id so it doesn't mutate
+    /// the global recorder (the emission returns early at the metadata lookup;
+    /// counter-registry dispatch is covered by `node_wait_counter_is_registered`).
+    #[tokio::test]
+    async fn wrapping_exec_streams_all_rows_under_slow_consumer() {
+        let schema = test_schema();
+        // Three batches in a single partition → multiple yield/resume cycles.
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let source_exec = mem_table.scan(&state, None, &[], None).await.unwrap();
+
+        let wrapping = Arc::new(WrappingExec::new(
+            source_exec,
+            "bp_unregistered_node".to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch must be Ok");
+            total_rows += batch.num_rows();
+            // Slow consumer: force >1ms of backpressure before the next poll.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        assert_eq!(
+            total_rows,
+            test_batch().num_rows() * 3,
+            "all rows must flow through the instrumented loop"
+        );
+    }
+
+    /// The `BackpressureRole` builders set the expected role, and
+    /// `with_new_children` carries it across reconstruction (so a post-attribution
+    /// optimizer rewrite can't drop the stamp).
+    #[test]
+    fn backpressure_role_builders_and_with_new_children_preserve_role() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(test_schema()));
+
+        let base = WrappingExec::new(leaf, "app::node".to_string(), vec![], vec![], None);
+        assert_eq!(base.backpressure_role(), &BackpressureRole::Unattributed);
+
+        let edge = base.clone().with_downstream_id("consumer".to_string());
+        assert_eq!(
+            edge.backpressure_role(),
+            &BackpressureRole::Edge("consumer".to_string())
+        );
+
+        let suppressed = base.suppress_backpressure();
+        assert_eq!(
+            suppressed.backpressure_role(),
+            &BackpressureRole::FanOutProducer
+        );
+
+        // with_new_children must carry the role across reconstruction.
+        let edge_arc: Arc<dyn ExecutionPlan> = Arc::new(edge);
+        let children: Vec<Arc<dyn ExecutionPlan>> =
+            edge_arc.children().into_iter().cloned().collect();
+        let rebuilt = edge_arc.with_new_children(children).unwrap();
+        let rebuilt_we = rebuilt
+            .downcast_ref::<WrappingExec>()
+            .expect("rebuilt node must still be a WrappingExec");
+        assert_eq!(
+            rebuilt_we.backpressure_role(),
+            &BackpressureRole::Edge("consumer".to_string())
+        );
+    }
+
+    /// A test-only source that delays before yielding each input batch, so the
+    /// `WrappingExec`'s `data.next().await` genuinely blocks on upstream — the
+    /// condition that produces `node_wait{state="starved"}`. Delegates schema
+    /// and plan properties to a wrapped `inner` (a `MemTable` scan) so we don't
+    /// have to hand-build `PlanProperties`.
+    #[derive(Debug)]
+    struct SlowInputExec {
+        inner: Arc<dyn ExecutionPlan>,
+        per_batch_delay: Duration,
+    }
+
+    impl DisplayAs for SlowInputExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "SlowInputExec")
+        }
+    }
+
+    impl ExecutionPlan for SlowInputExec {
+        fn name(&self) -> &str {
+            "SlowInputExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(SlowInputExec {
+                inner: children.swap_remove(0),
+                per_batch_delay: self.per_batch_delay,
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let mut input = self.inner.execute(partition, context)?;
+            let delay = self.per_batch_delay;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                loop {
+                    // The sleep happens inside the poll the WrappingExec awaits,
+                    // so it is measured as time waiting on upstream input.
+                    tokio::time::sleep(delay).await;
+                    match input.next().await {
+                        Some(batch) => yield batch,
+                        None => break,
+                    }
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    /// A test-only task-decoupled operator: claims the wrapper's
+    /// `TaskWaitMeter`, takes one input batch, works for `work`, then fails.
+    #[derive(Debug)]
+    struct WorkThenFailExec {
+        inner: Arc<dyn ExecutionPlan>,
+        work: Duration,
+    }
+
+    impl DisplayAs for WorkThenFailExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "WorkThenFailExec")
+        }
+    }
+
+    impl ExecutionPlan for WorkThenFailExec {
+        fn name(&self) -> &str {
+            "WorkThenFailExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(WorkThenFailExec {
+                inner: children.swap_remove(0),
+                work: self.work,
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let task_wait = TaskWaitMeter::claim(&context);
+            let mut input = self.inner.execute(partition, context)?;
+            let work = self.work;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                let _ = task_wait.next(&mut input).await;
+                tokio::time::sleep(work).await;
+                yield Err(DataFusionError::Execution("work failed".to_string()));
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    /// Task work that ends in an error is still the node's work: it is
+    /// `busy`. A terminal poll delivers no batch, so it adds no
+    /// `elapsed_compute` sample.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn task_work_before_a_terminal_error_is_reported_as_busy() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "work_then_fail_busy";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(WrappingExec::new(
+            Arc::new(WorkThenFailExec {
+                inner: source_exec,
+                work: Duration::from_millis(30),
+            }),
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        assert!(stream.next().await.expect("one item").is_err());
+        assert!(stream.next().await.is_none());
+
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            busy >= 20,
+            "30ms of task work before the error must be busy, got {busy}ms"
+        );
+        assert_eq!(
+            elapsed_compute, 0,
+            "a terminal poll belongs to no batch, got {elapsed_compute}ms"
+        );
+    }
+
+    /// A filtered source's `node_wait` states are measured by its `SourceInput`
+    /// wrapper, so only that wrapper emits `blocked`; the `SourceOutput` wrapper
+    /// above the filter emits none, or the source's blocked would count twice.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn only_source_input_wrapper_records_blocked() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        for (role, node_id, expect_blocked) in [
+            (
+                WrappingRole::SourceInput {
+                    input_rows_id: None,
+                },
+                "blocked_source_input",
+                true,
+            ),
+            (WrappingRole::SourceOutput, "blocked_source_output", false),
+        ] {
+            test_support::init_recorder_with_node(node_id);
+            let mem_table = MemTable::try_new(
+                test_schema(),
+                vec![vec![test_batch(), test_batch(), test_batch()]],
+            )
+            .unwrap();
+            let ctx = SessionContext::new();
+            let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+            let wrapping = Arc::new(
+                WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
+                    .with_role(role.clone()),
+            );
+            let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+            while let Some(batch) = stream.next().await {
+                batch.expect("batch must be Ok");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let blocked = test_support::node_wait_ms(node_id, "blocked", Some(""));
+            assert_eq!(
+                blocked >= 10,
+                expect_blocked,
+                "{role:?} recorded blocked={blocked}ms"
+            );
+        }
+    }
+
+    /// A filtered source has two wrappers: `SourceInput` below the filter and
+    /// `SourceOutput` above it, both under the source's id. The `SourceOutput`
+    /// wrapper's input wait is the `SourceInput` wrapper's wait plus the filter,
+    /// so it must emit neither `starved` nor a folded input wait; otherwise the
+    /// source's starved and elapsed_compute count the connector wait twice.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn source_output_wrapper_records_no_input_wait() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "source_output_no_wait";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(10),
+        });
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = Arc::new(
+            StreamingFilterExec::from_original(FilterExec::try_new(predicate, slow_input).unwrap())
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let output_counter = Arc::new(
+            WrappingExec::new(filter, node_id.to_string(), vec![], vec![], None)
+                .with_role(WrappingRole::SourceOutput),
+        );
+        let mut stream = output_counter.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch must be Ok");
+        }
+
+        assert_eq!(test_support::node_wait_ms(node_id, "starved", None), 0);
+        // ~30ms of input wait would show here if folded; the filter's own
+        // compute over three tiny batches stays far below that.
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            elapsed_compute < 10,
+            "SourceOutput folded its input wait into elapsed_compute: {elapsed_compute}ms"
+        );
+    }
+
+    /// A filtered claiming source (Kafka) through the real wrapper pair: the
+    /// source's task reports `starved`, `busy` and `blocked` once. The
+    /// `SourceOutput` wrapper's meter stays unclaimed, so a starved gate that
+    /// ignored its role would add its input wait as a second `starved`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn filtered_claiming_source_measures_node_wait_once() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "filtered_claiming_source";
+        test_support::init_recorder_with_node(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(4).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let source: Arc<dyn ExecutionPlan> = Arc::new(BufferedWorkExec {
+            inner: Arc::new(SlowInputExec {
+                inner: source_exec,
+                per_batch_delay: Duration::from_millis(10),
+            }),
+            work: Duration::from_millis(10),
+            capacity: 1,
+        });
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = Arc::new(
+            StreamingFilterExec::from_original(FilterExec::try_new(predicate, source).unwrap())
+                .unwrap(),
+        );
+        let plan = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            filter,
+            node_id,
+            vec![],
+            None,
+            None,
+            false,
+        );
+
+        let started = Instant::now();
+        let mut stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        // The task fills the 1-slot channel before the first poll: blocked.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+        let elapsed = started.elapsed().as_millis() as u64;
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some(""));
+        assert!(starved >= 30, "4 x 10ms input waits, got {starved}ms");
+        assert!(busy >= 30, "4 x 10ms task work, got {busy}ms");
+        assert!(blocked >= 10, "send into a full channel, got {blocked}ms");
+        // The task's states are disjoint spans of the run; a second emitter
+        // under the source id pushes the sum past it.
+        assert!(
+            starved + busy + blocked <= elapsed,
+            "starved {starved} + busy {busy} + blocked {blocked} > elapsed {elapsed}ms"
+        );
+    }
+
+    /// Claims the meter like a task-decoupled operator (Kafka source,
+    /// handler): a spawned task reads the input, works `work` per batch, and
+    /// sends into a bounded channel the stream reads.
+    #[derive(Debug)]
+    struct BufferedWorkExec {
+        inner: Arc<dyn ExecutionPlan>,
+        work: Duration,
+        capacity: usize,
+    }
+
+    impl DisplayAs for BufferedWorkExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "BufferedWorkExec")
+        }
+    }
+
+    impl ExecutionPlan for BufferedWorkExec {
+        fn name(&self) -> &str {
+            "BufferedWorkExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(BufferedWorkExec {
+                inner: children.swap_remove(0),
+                work: self.work,
+                capacity: self.capacity,
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let task_wait = TaskWaitMeter::claim(&context);
+            let mut input = self.inner.execute(partition, context)?;
+            let work = self.work;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(self.capacity);
+            // Stands in for the operator's own task; the test owns its lifetime.
+            #[allow(clippy::disallowed_methods)]
+            tokio::spawn(async move {
+                while let Some(item) = task_wait.next(&mut input).await {
+                    tokio::time::sleep(work).await;
+                    if task_wait.send(tx.send(item)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let stream = async_stream::stream! {
+                while let Some(item) = rx.recv().await {
+                    yield item;
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                stream,
+            )))
+        }
+    }
+
+    /// A SQL transform without subtree metrics (`SELECT * FROM src`) has no
+    /// compute to report, so its `elapsed_compute` is its poll time, as on
+    /// `main`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_sql_transform_without_subtree_metrics_records_poll_time() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "sql_without_subtree_metrics";
+        test_support::init_recorder_with_sql_transform(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(3).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(20),
+        });
+        assert!(slow_input.metrics().is_none());
+        let wrapping = Arc::new(WrappingExec::new(
+            slow_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert_eq!(test_support::elapsed_compute_samples(node_id), 3);
+        assert!(
+            elapsed_compute >= 50,
+            "3 x 20ms polls, got elapsed_compute {elapsed_compute}ms"
+        );
+    }
+
+    /// A task operator's `blocked` is its wait to send into a full output
+    /// channel. A slow downstream that never fills the channel holds nothing
+    /// back, so the task's time is all `starved` and `busy`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_task_operator_is_blocked_only_while_its_send_waits() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "task_blocked_is_send_wait";
+        test_support::init_recorder_with_node(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(5).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(
+            WrappingExec::new(
+                Arc::new(BufferedWorkExec {
+                    inner: source_exec,
+                    work: Duration::from_millis(20),
+                    capacity: 16,
+                }),
+                node_id.to_string(),
+                vec![],
+                vec![],
+                None,
+            )
+            .with_downstream_id("slow_sink".to_string()),
+        );
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some("slow_sink"));
+        assert!(busy >= 80, "5 x 20ms task work is busy, got {busy}ms");
+        assert!(
+            blocked < 10,
+            "the 16-slot channel never filled, got blocked {blocked}ms"
+        );
+    }
+
+    #[derive(Debug)]
+    struct SlowSideOutput(Duration);
+
+    #[async_trait]
+    impl SourceSideOutput for SlowSideOutput {
+        async fn process(&self, _batch: &RecordBatch) -> Result<()> {
+            tokio::time::sleep(self.0).await;
+            Ok(())
+        }
+    }
+
+    /// The wrapper's own work on a batch (side outputs) keeps it from taking
+    /// the next one, so a task operator's send waits. That wait is not the
+    /// downstream's doing, so it is not the edge's `blocked`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_task_operators_send_is_not_blocked_by_the_wrappers_own_work() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "task_send_waits_on_side_outputs";
+        test_support::init_recorder_with_node(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(5).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(
+            WrappingExec::new(
+                Arc::new(BufferedWorkExec {
+                    inner: source_exec,
+                    work: Duration::ZERO,
+                    capacity: 1,
+                }),
+                node_id.to_string(),
+                vec![Arc::new(SlowSideOutput(Duration::from_millis(50)))],
+                vec![],
+                None,
+            )
+            .with_downstream_id("fast_sink".to_string()),
+        );
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some("fast_sink"));
+        assert!(
+            blocked < 30,
+            "the downstream polled at once; the send waited on side outputs, got blocked {blocked}ms"
+        );
+    }
+
+    /// Outside a SQL transform, `elapsed_compute` keeps its `main` meaning:
+    /// the wrapper's poll time per batch. A task operator that already
+    /// buffered its output answers each poll at once, whatever its task's
+    /// work, so the series must not carry that work.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn task_operator_elapsed_compute_is_the_wrapper_poll_time() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "buffered_task_poll_time";
+        test_support::init_recorder_with_node(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(5).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(WrappingExec::new(
+            Arc::new(BufferedWorkExec {
+                inner: source_exec,
+                work: Duration::from_millis(20),
+                capacity: 16,
+            }),
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        // The task works through every batch before the first poll.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(busy >= 80, "5 x 20ms task work is busy, got {busy}ms");
+        assert!(
+            elapsed_compute < 10,
+            "every poll found a buffered batch, got elapsed_compute {elapsed_compute}ms"
+        );
+    }
+
+    /// `WrappingExec::execute` must emit `node_wait{state="starved"}` when its
+    /// input stream makes it wait on upstream. Drives a slow source (10ms per
+    /// batch) under a fast consumer and reads the emitted counter back via the
+    /// in-process collectable meter provider.
+    // The std `TEST_LOCK` is intentionally held across await points to serialize
+    // these tests against every other test that mutates the global recorder
+    // singleton. Each `#[tokio::test]` runs on its own single-threaded runtime
+    // and no task on that runtime ever contends this lock, so the usual
+    // await-holding-lock starvation hazard does not apply.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wrapping_exec_emits_starved_when_input_is_slow() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "starved_unit_source";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        // Three batches → three delayed input polls that each count as starvation.
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(10),
+        });
+
+        let wrapping = Arc::new(WrappingExec::new(
+            slow_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut total_rows = 0usize;
+        // Fast consumer: no sleep, so backpressure stays ~0 and the wait we
+        // observe is upstream starvation, not downstream blocking.
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.expect("batch must be Ok").num_rows();
+        }
+        assert_eq!(
+            total_rows,
+            test_batch().num_rows() * 3,
+            "all rows must flow through"
+        );
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        // ~30ms expected (3 × 10ms); assert well below that so scheduling
+        // jitter on a loaded CI box can't flake it, but high enough to prove
+        // real starvation was recorded rather than a stray sub-ms tick.
+        assert!(
+            starved >= 10,
+            "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
+        );
+    }
+
+    /// `node_empty_batches` counts zero-row data batches, so a node that runs
+    /// but moves no rows is visible. A zero-row batch that carries checkpoint
+    /// messages is control traffic, not an empty data batch.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn wrapping_exec_counts_empty_data_batches_but_not_marker_batches() {
+        use crate::checkpoints::checkpoint_management::{CheckpointEpoch, CheckpointMessage};
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "empty_batches_unit_source";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let empty = RecordBatch::new_empty(schema.clone());
+        let marker_only = crate::operators::marker_only_batch(
+            &schema,
+            &[CheckpointMessage::Marker {
+                epoch: CheckpointEpoch(1),
+                created_at_ms: 0,
+            }],
+        );
+        // `MemorySourceConfig`, not `MemTable`: the marker batch's schema
+        // carries metadata, which `MemTable` rejects as a mismatch.
+        let source_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![empty.clone(), test_batch(), marker_only, empty]],
+            schema,
+            None,
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let wrapping = Arc::new(WrappingExec::new(
+            source_exec,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut batches = 0;
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch must be Ok");
+            batches += 1;
+        }
+        assert_eq!(batches, 4, "every batch must flow through");
+        assert_eq!(
+            test_support::counter_total("node_empty_batches", node_id),
+            2,
+            "two empty data batches; the marker-only batch is not counted"
+        );
+    }
+
+    /// Empty batches are banked on the data path: only the flusher (or
+    /// `Drop`) calls the recorder, however far apart they arrive.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn empty_batches_are_banked_until_a_flush() {
+        use crate::telemetry::node_time::{flush_live, hold_flusher};
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "empty_batches_banked";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![RecordBatch::new_empty(schema); 3]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(WrappingExec::new(
+            Arc::new(SlowInputExec {
+                inner: source_exec,
+                per_batch_delay: Duration::from_millis(5),
+            }),
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let held = hold_flusher();
+        for _ in 0..3 {
+            stream
+                .next()
+                .await
+                .expect("batch")
+                .expect("batch must be Ok");
+        }
+        assert_eq!(
+            test_support::counter_total("node_empty_batches", node_id),
+            0,
+            "no recorder call before a flush"
+        );
+        drop(held);
+        flush_live();
+        assert_eq!(
+            test_support::counter_total("node_empty_batches", node_id),
+            3
+        );
+    }
+
+    /// Cancelling the stream mid-run must still report the banked count
+    /// instead of dropping it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn empty_batch_burst_is_fully_counted_when_the_stream_is_cancelled() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "empty_batches_burst_cancel";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mut batches = vec![RecordBatch::new_empty(schema.clone()); 200];
+        batches.push(test_batch());
+        let source_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[batches],
+            schema,
+            None,
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let wrapping = Arc::new(WrappingExec::new(
+            source_exec,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        for _ in 0..200 {
+            stream
+                .next()
+                .await
+                .expect("batch")
+                .expect("batch must be Ok");
+        }
+        // The data batch is never polled: the stream is cancelled mid-run.
+        drop(stream);
+
+        assert_eq!(
+            test_support::counter_total("node_empty_batches", node_id),
+            200
+        );
+    }
+
+    /// Drive a `WrappingExec` with the given `backpressure_role` under a slow
+    /// consumer (sleeps between polls so each yield→resume gap is real blocked
+    /// time) and return the rows streamed. The recorder must already be
+    /// initialized with `node_id`.
+    async fn run_under_slow_consumer(node_id: &str, role: BackpressureRole) -> usize {
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let wrapping = Arc::new(
+            WrappingExec::new(
+                Arc::clone(&source_exec),
+                node_id.to_string(),
+                vec![],
+                vec![],
+                None,
+            )
+            .clone_with_role_and_inner(role, source_exec),
+        );
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.expect("batch must be Ok").num_rows();
+            // Slow consumer: force >1ms of yield→resume backpressure per batch.
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        total_rows
+    }
+
+    /// Runtime proof of the fan-out suppression invariant: with an `Edge` role a
+    /// `WrappingExec` emits `node_wait{state="blocked", downstream_id=...}`, but
+    /// with `FanOutProducer` its blocked emission is skipped entirely (the
+    /// `BroadcastStream` owns that edge). Both nodes stream identical data under
+    /// the same slow consumer, so the FanOut node's absence of a blocked series
+    /// reflects suppression, not missing traffic.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn fanout_producer_suppresses_blocked_while_edge_emits() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let edge_id = "blocked_edge_unit_node";
+        let fanout_id = "blocked_fanout_unit_node";
+        test_support::init_recorder_with_nodes(&[edge_id, fanout_id]);
+
+        let expected_rows = test_batch().num_rows() * 3;
+
+        let edge_rows =
+            run_under_slow_consumer(edge_id, BackpressureRole::Edge("consumer".to_string())).await;
+        assert_eq!(edge_rows, expected_rows, "edge node must stream all rows");
+
+        let fanout_rows =
+            run_under_slow_consumer(fanout_id, BackpressureRole::FanOutProducer).await;
+        assert_eq!(
+            fanout_rows, expected_rows,
+            "fan-out node must stream all rows too (absence of metric is suppression, not missing data)"
+        );
+
+        // Edge role: emits blocked, attributed to its named downstream.
+        let edge_blocked = test_support::node_wait_ms(edge_id, "blocked", Some("consumer"));
+        assert!(
+            edge_blocked >= 4,
+            "Edge role must emit blocked for downstream_id=consumer, got {edge_blocked}ms"
+        );
+
+        // FanOutProducer role: no blocked series for this node at all (any
+        // downstream_id), because emission is suppressed in favor of the
+        // BroadcastStream's per-edge series.
+        let fanout_blocked = test_support::node_wait_ms(fanout_id, "blocked", None);
+        assert_eq!(
+            fanout_blocked, 0,
+            "FanOutProducer must suppress its own blocked emission, got {fanout_blocked}ms"
+        );
+    }
+
+    /// Complements `fanout_producer_suppresses_blocked_while_edge_emits`: an
+    /// `Edge` role stamps the emitted `blocked` series with exactly the named
+    /// `downstream_id`, so a query pinning the wrong consumer sees nothing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn edge_role_blocked_carries_downstream_id_tag() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "blocked_edge_tag_node";
+        test_support::init_recorder_with_node(node_id);
+
+        let rows =
+            run_under_slow_consumer(node_id, BackpressureRole::Edge("real_sink".to_string())).await;
+        assert_eq!(rows, test_batch().num_rows() * 3);
+
+        assert!(
+            test_support::node_wait_ms(node_id, "blocked", Some("real_sink")) >= 4,
+            "blocked must be tagged with the real downstream_id"
+        );
+        assert_eq!(
+            test_support::node_wait_ms(node_id, "blocked", Some("wrong_sink")),
+            0,
+            "no blocked series should exist for a downstream the node doesn't feed"
+        );
     }
 
     /// Records every row the inner sink actually receives.
@@ -1870,6 +3201,375 @@ mod tests {
 
         let ids = ids_written.lock().unwrap();
         ids.clone()
+    }
+
+    /// A sink waiting on its upstream is starved just like any other node:
+    /// `WrappingDataSink` must emit `node_wait{state="starved"}` for the wait
+    /// in front of each delivered batch.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn wrapping_data_sink_emits_starved_when_input_is_slow() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "starved_unit_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let slow_input = futures::stream::iter([test_batch(), test_batch(), test_batch()]).then(
+            |batch| async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(batch)
+            },
+        );
+        let sink = WrappingDataSink::new(
+            Arc::new(RecordingSink {
+                schema: schema.clone(),
+                ids_written: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        let rows = sink
+            .write_all(
+                Box::pin(RecordBatchStreamAdapter::new(schema, slow_input)),
+                &Arc::new(TaskContext::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, test_batch().num_rows() as u64 * 3);
+
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(
+            starved >= 10,
+            "expected sink starved >= 10ms for a 3×10ms slow input, got {starved}ms"
+        );
+    }
+
+    /// A sink that takes `per_batch` to write each batch.
+    #[derive(Debug)]
+    struct SlowWriteSink {
+        schema: SchemaRef,
+        per_batch: Duration,
+    }
+
+    impl DisplayAs for SlowWriteSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "SlowWriteSink")
+        }
+    }
+
+    #[async_trait]
+    impl DataSink for SlowWriteSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+
+        async fn write_all(
+            &self,
+            mut data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut rows = 0u64;
+            while let Some(batch) = data.next().await {
+                rows += batch?.num_rows() as u64;
+                tokio::time::sleep(self.per_batch).await;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// A sink's own write time is `busy`, so `busy` must not be derived from
+    /// the connector's `elapsed_compute` minus `starved`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn wrapping_data_sink_reports_write_time_as_busy() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_unit_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let input = futures::stream::iter([test_batch(), test_batch(), test_batch()]).map(Ok);
+        let sink = WrappingDataSink::new(
+            Arc::new(SlowWriteSink {
+                schema: schema.clone(),
+                per_batch: Duration::from_millis(20),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        sink.write_all(
+            Box::pin(RecordBatchStreamAdapter::new(schema, input)),
+            &Arc::new(TaskContext::default()),
+        )
+        .await
+        .unwrap();
+
+        let busy = test_support::node_wait_ms(node_id, "busy", Some(""));
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(busy >= 60, "3 x 20ms writes must be busy, got {busy}ms");
+        assert!(
+            starved < 20,
+            "an in-memory input is not a wait, got {starved}ms"
+        );
+    }
+
+    /// Writes slowly like `SlowWriteSink`, but reads its input with
+    /// `ready_chunks`, as `HttpSink` does: after each batch it polls once more,
+    /// gets `Pending`, and writes without polling again.
+    #[derive(Debug)]
+    struct PrefetchingSlowSink {
+        schema: SchemaRef,
+        per_chunk: Duration,
+    }
+
+    impl DisplayAs for PrefetchingSlowSink {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "PrefetchingSlowSink")
+        }
+    }
+
+    #[async_trait]
+    impl DataSink for PrefetchingSlowSink {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+
+        async fn write_all(
+            &self,
+            data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut rows = 0u64;
+            let mut chunks = data.ready_chunks(4);
+            while let Some(batches) = chunks.next().await {
+                for batch in batches {
+                    rows += batch?.num_rows() as u64;
+                }
+                tokio::time::sleep(self.per_chunk).await;
+            }
+            Ok(rows)
+        }
+    }
+
+    /// A sink that prefetches with `ready_chunks` leaves its input poll
+    /// `Pending` while it writes. That write is still `busy`: the input was
+    /// ready long before the sink asked again.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_prefetching_sink_write_is_busy_not_starved() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_prefetching_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        // Each batch is ready one scheduler turn after it is asked for. The
+        // write after the last batch follows end-of-stream, which ends the
+        // measured stream, so only the first three writes are measured.
+        let input = futures::stream::iter([test_batch(), test_batch(), test_batch(), test_batch()])
+            .then(|batch| async move {
+                tokio::task::yield_now().await;
+                Ok(batch)
+            });
+        let sink = WrappingDataSink::new(
+            Arc::new(PrefetchingSlowSink {
+                schema: schema.clone(),
+                per_chunk: Duration::from_millis(30),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        sink.write_all(
+            Box::pin(RecordBatchStreamAdapter::new(schema, input)),
+            &Arc::new(TaskContext::default()),
+        )
+        .await
+        .unwrap();
+
+        let busy = test_support::node_wait_ms(node_id, "busy", Some(""));
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(busy >= 80, "3 x 30ms writes must be busy, got {busy}ms");
+        assert!(
+            starved < 20,
+            "the input was ready during each write, got starved {starved}ms"
+        );
+    }
+
+    /// A prefetching sink's hung write must show as `busy` while it hangs,
+    /// not as `starved` that turns into `busy` only when the write returns.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_hung_prefetching_sink_write_is_busy_while_it_hangs() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_hung_prefetching_sink";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        // The next batch is ready 5ms after the sink asks, while it writes.
+        let input = futures::stream::iter([test_batch(), test_batch()]).then(|batch| async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(batch)
+        });
+        let sink = WrappingDataSink::new(
+            Arc::new(PrefetchingSlowSink {
+                schema: schema.clone(),
+                per_chunk: Duration::from_millis(3_000),
+            }),
+            node_id.to_string(),
+            None,
+            None,
+        );
+        let context = Arc::new(TaskContext::default());
+        let (written, (busy, starved)) = tokio::join!(
+            sink.write_all(
+                Box::pin(RecordBatchStreamAdapter::new(schema, input)),
+                &context
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(2_300)).await;
+                (
+                    test_support::node_wait_ms(node_id, "busy", Some("")),
+                    test_support::node_wait_ms(node_id, "starved", Some("")),
+                )
+            }
+        );
+        assert!(
+            busy >= 1_000,
+            "the hung write must show as busy while it lasts, got {busy}ms"
+        );
+        assert!(
+            starved < 200,
+            "the input was ready 5ms into the write, got starved {starved}ms"
+        );
+        written.unwrap();
+    }
+
+    /// A wait must show while it lasts. Reporting it only when it ends hides a
+    /// stalled pipeline until it recovers, or forever if the pod dies first.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn starved_stall_is_reported_before_the_batch_arrives() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "starved_stall_in_progress";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let stalled_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(3_000),
+        });
+        let wrapping = Arc::new(WrappingExec::new(
+            stalled_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let (arrived, during_stall) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(2_300)).await;
+            test_support::node_wait_ms(node_id, "starved", None)
+        });
+        assert!(
+            during_stall >= 1_000,
+            "the open input wait must be reported while it lasts, got {during_stall}ms"
+        );
+        assert!(arrived.is_some(), "the stalled batch still arrives");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn blocked_stall_is_reported_before_the_downstream_resumes() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "blocked_stall_in_progress";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![test_batch(), test_batch()]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let wrapping = Arc::new(
+            WrappingExec::new(source_exec, node_id.to_string(), vec![], vec![], None)
+                .with_downstream_id("stuck_sink".to_string()),
+        );
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        stream.next().await.unwrap().unwrap();
+
+        // The downstream does not ask for the next batch.
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
+        let during_stall = test_support::node_wait_ms(node_id, "blocked", Some("stuck_sink"));
+        assert!(
+            during_stall >= 1_000,
+            "the open blocked span must be reported while it lasts, got {during_stall}ms"
+        );
+        while stream.next().await.is_some() {}
+    }
+
+    /// A downstream that prefetches with `ready_chunks` leaves this node's
+    /// input poll `Pending` while it works. From the input's wake on, the
+    /// batch waits for the downstream: that is `blocked`, not `starved`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn a_prefetching_downstream_blocks_instead_of_starving() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "blocked_prefetching_downstream";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let batches = vec![test_batch(), test_batch(), test_batch(), test_batch()];
+        let mem_table = MemTable::try_new(schema, vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(1),
+        });
+        let wrapping = Arc::new(
+            WrappingExec::new(slow_input, node_id.to_string(), vec![], vec![], None)
+                .with_downstream_id("prefetching_sink".to_string()),
+        );
+
+        let mut chunks = wrapping.execute(0, ctx.task_ctx()).unwrap().ready_chunks(4);
+        while chunks.next().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some("prefetching_sink"));
+        let starved = test_support::node_wait_ms(node_id, "starved", Some(""));
+        assert!(
+            blocked >= 80,
+            "3 x 30ms downstream work must be blocked, got {blocked}ms"
+        );
+        assert!(
+            starved < 20,
+            "the input was ready within 1ms, got starved {starved}ms"
+        );
     }
 
     #[tokio::test]

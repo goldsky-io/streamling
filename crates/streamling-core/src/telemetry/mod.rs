@@ -1,7 +1,11 @@
+pub use streamling_plugin::arrow_bytes;
 pub mod event_time_reader;
+pub mod node_time;
 pub mod provider;
 pub mod recorder;
+pub mod task_wait;
 pub mod types;
+pub mod wake_timed;
 
 pub use event_time_reader::{EventTimeReadError, EventTimeReader};
 pub use provider::{

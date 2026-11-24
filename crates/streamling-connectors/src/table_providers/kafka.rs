@@ -60,6 +60,7 @@ use streamling_state::StateKey;
 use streamling_state::StateOperatorBackend;
 
 use apache_avro::types::Value::Union;
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::sink::DataSink;
 use datafusion::logical_expr::dml::InsertOp;
@@ -94,8 +95,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
+use streamling_core::telemetry::arrow_bytes::batch_data_bytes;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::{MetricsRecorder, SnapshotGauge, get_metrics_recorder};
+use streamling_core::telemetry::task_wait::TaskWaitMeter;
 use streamling_core::topology::Telemetry;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
@@ -132,13 +135,16 @@ impl KafkaProducerContext {
 impl ClientContext for KafkaProducerContext {}
 
 impl rdkafka::producer::ProducerContext for KafkaProducerContext {
-    type DeliveryOpaque = ();
+    type DeliveryOpaque = Arc<BatchDelivery>;
 
     fn delivery(
         &self,
         result: &rdkafka::producer::DeliveryResult<'_>,
-        _opaque: Self::DeliveryOpaque,
+        batch: Self::DeliveryOpaque,
     ) {
+        if result.is_ok() {
+            batch.delivered.fetch_add(1, Ordering::Relaxed);
+        }
         if let Err((e, msg)) = result {
             let topic = msg.topic();
             error!("Kafka delivery failed for topic {}: {}", topic, e);
@@ -151,6 +157,46 @@ impl rdkafka::producer::ProducerContext for KafkaProducerContext {
 }
 
 type KafkaThreadedProducer = ThreadedProducer<KafkaProducerContext>;
+
+/// One sink batch on its way to the broker. Every message of the batch holds a reference;
+/// the last one released (by its delivery callback, or by a send that never queued it)
+/// records the rows the broker acknowledged and their share of the batch's bytes.
+struct BatchDelivery {
+    metrics_recorder: Arc<MetricsRecorder>,
+    metric_metadata_id: String,
+    batch_rows: u64,
+    batch_bytes: Option<std::result::Result<usize, ArrowError>>,
+    delivered: AtomicU64,
+}
+
+impl BatchDelivery {
+    fn new(
+        batch: &RecordBatch,
+        metrics_recorder: Arc<MetricsRecorder>,
+        metric_metadata_id: &str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            metrics_recorder,
+            metric_metadata_id: metric_metadata_id.to_string(),
+            batch_rows: batch.num_rows() as u64,
+            batch_bytes: Some(batch_data_bytes(batch)),
+            delivered: AtomicU64::new(0),
+        })
+    }
+}
+
+impl Drop for BatchDelivery {
+    fn drop(&mut self) {
+        if let Some(batch_bytes) = self.batch_bytes.take() {
+            self.metrics_recorder.record_sink_delivery(
+                *self.delivered.get_mut(),
+                self.batch_rows,
+                batch_bytes,
+                &self.metric_metadata_id,
+            );
+        }
+    }
+}
 
 static CONSUMER_SEEK_TIMEOUT_SEC: u64 = 60;
 static CONSUMER_ASSIGNMENT_TIMEOUT_SEC: u64 = 60;
@@ -330,9 +376,12 @@ impl Drop for SafeKafkaProducer {
             // Detached OS thread, not spawn_blocking — see SafeKafkaConsumer:
             // a blocking task queued during runtime shutdown never runs and
             // its closure is dropped inline on the shutdown thread, restoring
-            // the very deadlock this wrapper exists to prevent. The stream has
-            // already flushed by the time its producer drops, so abandoning
-            // the destroy at process exit loses nothing.
+            // the very deadlock this wrapper exists to prevent. A stream that
+            // ends cleanly has flushed already. On an error or cancellation,
+            // the destroy delivers the last acks, so their BatchDelivery
+            // records can land late or be lost at exit. Those rows all follow
+            // the last acked checkpoint, so the restart replays and recounts
+            // them.
             tracing::info!(
                 "SafeKafkaProducer: moving rd_kafka_destroy to a detached thread \
                  to prevent worker-thread deadlock"
@@ -1663,13 +1712,16 @@ impl ExecutionPlan for KafkaSourceExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             self.full_schema_projected.clone(),
             self.internal_buffer_size as usize,
         );
         let tx = builder.tx();
+        // The consume loop runs in a spawned task: waiting on the broker is
+        // `starved`, decoding is `busy`.
+        let task_wait = TaskWaitMeter::claim(&context);
 
         let state_backend = self.state_backend.clone();
 
@@ -1857,7 +1909,10 @@ impl ExecutionPlan for KafkaSourceExec {
             // Unfortunately, the high-level StreamConsumer doesn't expose this method
             // So, instead, we trigger it indirectly by calling "next" on the stream
             // We'll seek to the correct position afterward based on state backend or config
-            if let Err(e) = Self::wait_for_initial_assignment_or_message(&consumer, &topic).await {
+            if let Err(e) = task_wait
+                .wait_input(Self::wait_for_initial_assignment_or_message(&consumer, &topic))
+                .await
+            {
                 // A shutdown requested while this instance was still starting
                 // (e.g. the record-limit stop path firing off a sibling
                 // instance's records) is a graceful stop, not a pipeline
@@ -1879,7 +1934,8 @@ impl ExecutionPlan for KafkaSourceExec {
             }
 
             // A blocking call to wait for the assignment to finish
-            let kafka_topic_partition_list = Self::wait_for_assignment(&consumer).await?;
+            let kafka_topic_partition_list =
+                task_wait.wait_input(Self::wait_for_assignment(&consumer)).await?;
             let kafka_topic_partition_list_to_seek = Self::find_offsets_in_state_backend(
                 state_backend.clone(),
                 reference_name.clone(),
@@ -2020,6 +2076,7 @@ impl ExecutionPlan for KafkaSourceExec {
 
                 let mut row_kinds = Vec::new();
                 let mut batch_row_count = 0u64;
+                let mut batch_payload_bytes = 0u64;
 
                 loop {
                     tokio::select! {
@@ -2042,7 +2099,7 @@ impl ExecutionPlan for KafkaSourceExec {
                             }
                         },
                         // Await the next record
-                        messge = consumer.recv() => {
+                        messge = task_wait.wait_input(consumer.recv()) => {
                             match messge {
                                 Ok(message) => {
                                     if should_enrich_op_column {
@@ -2066,7 +2123,7 @@ impl ExecutionPlan for KafkaSourceExec {
                                     converter.decode_and_buffer(&message).await?;
                                     watchdog.on_record();
                                     batch_row_count += 1;
-                                    metrics_recorder.record_count("input_rows", 1, metric_metadata_id.as_str());
+                                    batch_payload_bytes += message.payload().map_or(0, <[u8]>::len) as u64;
                                     if batch_row_count >= batch_size_limit {
                                         break;
                                     }
@@ -2084,6 +2141,9 @@ impl ExecutionPlan for KafkaSourceExec {
                 }
 
                 let payload_batch = converter.convert_to_batch()?;
+                if batch_payload_bytes > 0 {
+                    metrics_recorder.record_count("input_bytes_delta", batch_payload_bytes, metric_metadata_id.as_str());
+                }
 
                 let mut record_columns = payload_batch.columns().to_vec();
                 if append_op_column {
@@ -2180,7 +2240,7 @@ impl ExecutionPlan for KafkaSourceExec {
                     }
                 }
 
-                match tx.send(Ok(record_batch)).await {
+                match task_wait.send(tx.send(Ok(record_batch))).await {
                     Ok(_) => {}
                     Err(e) => {
                         // this could simply mean shutdown
@@ -2242,7 +2302,7 @@ impl ExecutionPlan for KafkaSourceExec {
                     full_schema.clone(),
                 );
                 if let Some(batch) = flush_batch
-                    && tx.send(Ok(batch)).await.is_err()
+                    && task_wait.send(tx.send(Ok(batch))).await.is_err()
                 {
                     warn!(
                         "Kafka source '{}': receiver dropped before final checkpoint flush",
@@ -2265,9 +2325,13 @@ impl ExecutionPlan for KafkaSourceExec {
                 // "committed in" is the broker commit + state-backend
                 // persistence that follows.
                 let wait_started = std::time::Instant::now();
-                if tokio::time::timeout(finalize_timeout, control.await_terminal_finalized())
-                    .await
-                    .is_ok()
+                // A wait on the sinks is neither input, work, nor a send.
+                if tokio::time::timeout(
+                    finalize_timeout,
+                    task_wait.untimed(control.await_terminal_finalized()),
+                )
+                .await
+                .is_ok()
                 {
                     let waited = wait_started.elapsed();
                     let commit_started = std::time::Instant::now();
@@ -3054,7 +3118,7 @@ impl KafkaSink {
     /// as before.
     fn send_record_absorbing_queue_full<K, P>(
         producer: &KafkaThreadedProducer,
-        mut record: BaseRecord<'_, K, P>,
+        mut record: BaseRecord<'_, K, P, Arc<BatchDelivery>>,
         topic: &str,
         shutdown: &tokio::sync::watch::Receiver<bool>,
         shutdown_retry_window: StdDuration,
@@ -3168,6 +3232,7 @@ impl KafkaSink {
         converter: &FromArrowToAvroConverter,
         encoder: &AvroEncoder<'_>,
         metrics_recorder: Arc<MetricsRecorder>,
+        delivery: &Arc<BatchDelivery>,
     ) -> streamling_core::error::Result<()> {
         let num_rows = batch.num_rows();
 
@@ -3210,7 +3275,13 @@ impl KafkaSink {
             num_rows, self.topic, total_bytes, avg_msg_bytes,
         );
 
-        self.send_payloads_to_producer(encoded_payloads, &row_kinds, keys.as_ref(), producer)
+        self.send_payloads_to_producer(
+            encoded_payloads,
+            &row_kinds,
+            keys.as_ref(),
+            producer,
+            delivery,
+        )
     }
 
     /// Extract keys from batch based on primary key column names
@@ -3250,6 +3321,7 @@ impl KafkaSink {
         batch: &RecordBatch,
         producer: &KafkaThreadedProducer,
         converter: &FromArrowToJsonConverter,
+        delivery: &Arc<BatchDelivery>,
     ) -> streamling_core::error::Result<()> {
         let num_rows = batch.num_rows();
 
@@ -3268,7 +3340,13 @@ impl KafkaSink {
             None
         };
 
-        self.send_payloads_to_producer(serialized_values, &row_kinds, keys.as_ref(), producer)
+        self.send_payloads_to_producer(
+            serialized_values,
+            &row_kinds,
+            keys.as_ref(),
+            producer,
+            delivery,
+        )
     }
 
     /// Send pre-serialized payloads to Kafka producers with key-based partitioning,
@@ -3280,6 +3358,7 @@ impl KafkaSink {
         row_kinds: &[RowKind],
         keys: Option<&Vec<String>>,
         producer: &KafkaThreadedProducer,
+        delivery: &Arc<BatchDelivery>,
     ) -> streamling_core::error::Result<()> {
         let topic = &self.topic;
         let shutdown = streamling_core::shutdown::subscribe();
@@ -3294,7 +3373,7 @@ impl KafkaSink {
                     value: Some(op.as_str()),
                 });
 
-                let mut record = BaseRecord::to(topic)
+                let mut record = BaseRecord::with_opaque_to(topic, delivery.clone())
                     .payload(&encoded_bytes)
                     .headers(headers);
 
@@ -3514,6 +3593,9 @@ impl DataSink for KafkaSink {
 
             if batch.num_rows() != 0 {
                 let start_at = Instant::now();
+                // Counted by the broker's delivery acks, not here.
+                let delivery =
+                    BatchDelivery::new(&batch, metrics_recorder.clone(), &self.metric_metadata_id);
                 match &sink_converter {
                     KafkaSinkConverter::Avro { converter, encoder } => {
                         self.send_batch_to_kafka_as_avro(
@@ -3522,11 +3604,12 @@ impl DataSink for KafkaSink {
                             converter,
                             encoder,
                             metrics_recorder.clone(),
+                            &delivery,
                         )
                         .await?;
                     }
                     KafkaSinkConverter::Json { converter } => {
-                        self.send_batch_to_kafka_as_json(&batch, producer, converter)?;
+                        self.send_batch_to_kafka_as_json(&batch, producer, converter, &delivery)?;
                     }
                 }
                 metrics_recorder.record_time(
@@ -3536,10 +3619,6 @@ impl DataSink for KafkaSink {
                 );
                 metrics_recorder
                     .record_elapsed_compute(start_at.elapsed(), self.metric_metadata_id.as_str());
-                metrics_recorder.record_output_rows_count(
-                    batch.num_rows() as u64,
-                    self.metric_metadata_id.as_str(),
-                )
             }
 
             row_count += batch.num_rows();
@@ -4007,11 +4086,20 @@ mod tests {
         assert_eq!(cfg.get("message.timeout.ms"), Some("600000"));
     }
 
+    fn test_delivery() -> Arc<BatchDelivery> {
+        let batch = RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
+        BatchDelivery::new(&batch, get_metrics_recorder().clone(), "test")
+    }
+
     fn unreachable_broker_producer(extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
-        let mut config = test_kafka_config();
         // Port 1 never hosts a broker; producer creation is offline so this
         // still succeeds and everything sent just sits in the local queue.
-        config.brokers = "127.0.0.1:1".to_string();
+        producer_for("127.0.0.1:1", extra_config)
+    }
+
+    fn producer_for(brokers: &str, extra_config: &[(&str, &str)]) -> KafkaThreadedProducer {
+        let mut config = test_kafka_config();
+        config.brokers = brokers.to_string();
         let mut builder =
             KafkaSink::build_producer_config(&config, None, None, None, KafkaCompression::None);
         for (key, value) in extra_config {
@@ -4020,6 +4108,58 @@ mod tests {
         builder
             .create_with_context(KafkaProducerContext::new())
             .expect("producer creation does not contact the broker")
+    }
+
+    fn send_with_delivery(
+        producer: &KafkaThreadedProducer,
+        topic: &str,
+        delivery: &Arc<BatchDelivery>,
+    ) {
+        producer
+            .send(BaseRecord::<str, str, _>::with_opaque_to(topic, delivery.clone()).payload("p"))
+            .map_err(|(e, _)| e)
+            .expect("send only queues locally");
+    }
+
+    /// The broker's acks, not the sends, drive the billed count, and every
+    /// callback releases its message's share so the batch's Drop records.
+    #[test]
+    fn delivery_callback_counts_acked_messages_and_releases_batch() {
+        let cluster = rdkafka::mocking::MockCluster::new(1).expect("mock cluster");
+        cluster.create_topic("ack-topic", 1, 1).expect("mock topic");
+        let producer = producer_for(&cluster.bootstrap_servers(), &[]);
+        let delivery = test_delivery();
+        send_with_delivery(&producer, "ack-topic", &delivery);
+        send_with_delivery(&producer, "ack-topic", &delivery);
+
+        producer
+            .flush(Duration::from_secs(10))
+            .expect("mock broker acks");
+
+        assert_eq!(delivery.delivered.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            Arc::strong_count(&delivery),
+            1,
+            "every callback released its clone"
+        );
+        assert!(producer.context().check_error().is_ok());
+    }
+
+    #[test]
+    fn failed_delivery_is_not_counted() {
+        let producer =
+            unreachable_broker_producer(&[("linger.ms", "0"), ("message.timeout.ms", "1")]);
+        let delivery = test_delivery();
+        send_with_delivery(&producer, "fail-topic", &delivery);
+
+        let deadline = StdInstant::now() + StdDuration::from_secs(10);
+        while Arc::strong_count(&delivery) > 1 {
+            assert!(StdInstant::now() < deadline, "delivery callback never ran");
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+
+        assert_eq!(delivery.delivered.load(Ordering::Relaxed), 0);
+        assert!(producer.context().check_error().is_err());
     }
 
     /// Regression: the pre-consume startup
@@ -4078,7 +4218,10 @@ mod tests {
     fn flush_gives_up_between_attempts_once_shutdown_requested() {
         let producer = unreachable_broker_producer(&[]);
         producer
-            .send(BaseRecord::<str, str>::to("flush-topic").payload("payload"))
+            .send(
+                BaseRecord::<str, str, _>::with_opaque_to("flush-topic", test_delivery())
+                    .payload("payload"),
+            )
             .map_err(|(e, _)| e)
             .expect("send only queues locally");
 
@@ -4104,7 +4247,10 @@ mod tests {
     fn queue_full_retry_gives_up_after_shutdown_window() {
         let producer = unreachable_broker_producer(&[("queue.buffering.max.messages", "1")]);
         producer
-            .send(BaseRecord::<str, str>::to("qf-topic").payload("fills-the-queue"))
+            .send(
+                BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                    .payload("fills-the-queue"),
+            )
             .map_err(|(e, _)| e)
             .expect("first send fits the single-slot queue");
 
@@ -4112,7 +4258,8 @@ mod tests {
         let start = StdInstant::now();
         let result = KafkaSink::send_record_absorbing_queue_full(
             &producer,
-            BaseRecord::<str, str>::to("qf-topic").payload("overflows"),
+            BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                .payload("overflows"),
             "qf-topic",
             &shutdown_rx,
             StdDuration::from_millis(300),
@@ -4135,7 +4282,10 @@ mod tests {
     fn queue_full_retry_keeps_retrying_without_shutdown() {
         let producer = unreachable_broker_producer(&[("queue.buffering.max.messages", "1")]);
         producer
-            .send(BaseRecord::<str, str>::to("qf-topic").payload("fills-the-queue"))
+            .send(
+                BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                    .payload("fills-the-queue"),
+            )
             .map_err(|(e, _)| e)
             .expect("first send fits the single-slot queue");
 
@@ -4149,7 +4299,8 @@ mod tests {
         let start = StdInstant::now();
         let result = KafkaSink::send_record_absorbing_queue_full(
             &producer,
-            BaseRecord::<str, str>::to("qf-topic").payload("overflows"),
+            BaseRecord::<str, str, _>::with_opaque_to("qf-topic", test_delivery())
+                .payload("overflows"),
             "qf-topic",
             &shutdown_rx,
             StdDuration::from_millis(0),

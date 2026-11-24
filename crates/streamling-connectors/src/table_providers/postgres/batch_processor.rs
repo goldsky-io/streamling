@@ -333,9 +333,11 @@ pub async fn process_batch(context: &BatchProcessorContext, batch: RecordBatch) 
     )
     .await;
 
-    context
-        .metrics_recorder
-        .record_output_rows_count(batch.num_rows() as u64, &context.metric_metadata_id);
+    context.metrics_recorder.record_sink_write(
+        &batch,
+        batch.num_rows() as u64,
+        &context.metric_metadata_id,
+    );
     context
         .metrics_recorder
         .record_elapsed_compute(start_at.elapsed(), &context.metric_metadata_id);

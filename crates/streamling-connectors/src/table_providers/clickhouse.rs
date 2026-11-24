@@ -62,8 +62,10 @@ use streamling_core::node_context::get_node_context;
 use streamling_core::operators::parallel_sink::ParallelSinkExec;
 use streamling_core::operators::wrapping::WrappingDataSink;
 use streamling_core::retry::{RetryOutcome, retry_forever_with_backoff_until_cancelled};
+use streamling_core::telemetry::arrow_bytes::batch_data_bytes;
 use streamling_core::telemetry::provider::get_reference_name_from_metric_key;
 use streamling_core::telemetry::recorder::get_metrics_recorder;
+use streamling_core::telemetry::task_wait::{TaskWaitHandle, TaskWaitMeter};
 use streamling_core::topology::Telemetry;
 use streamling_state::{StateBackendError, StateKey, StateOperatorBackend};
 use tokio::sync::watch;
@@ -1341,6 +1343,7 @@ impl DataSink for ClickHouseSinkExec {
             }
 
             let start_at = Instant::now();
+            let batch_bytes = batch_data_bytes(&batch);
 
             let normalized_schema_clone = normalized_schema.clone();
             let normalized_batch = match run_blocking(move || {
@@ -1498,7 +1501,12 @@ impl DataSink for ClickHouseSinkExec {
             );
 
             let num_rows = num_rows as u64;
-            metrics_recorder.record_output_rows_count(num_rows, &metric_metadata_id);
+            metrics_recorder.record_sink_delivery(
+                num_rows,
+                num_rows,
+                batch_bytes,
+                &metric_metadata_id,
+            );
             metrics_recorder.record_elapsed_compute(start_at.elapsed(), &metric_metadata_id);
 
             row_count += num_rows as usize;
@@ -1588,15 +1596,20 @@ impl ExecutionPlan for ClickHouseSourceExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let schema = self.provider.schema.clone();
+        let metric_metadata_id = self.provider.metric_metadata_id.clone();
+        let metrics_recorder = get_metrics_recorder().clone();
 
         let source_params = self
             .provider
             .source_params
             .as_ref()
             .ok_or_else(|| streamling_err!("ClickHouseSourceExec is not a source"))?;
+        // The scan runs in a spawned task. Reading pages is the source's own
+        // work (`busy`); only the backoff while ClickHouse fails is `starved`.
+        let task_wait = TaskWaitMeter::claim(&context);
 
         let mut builder = RecordBatchReceiverStreamBuilder::new(
             schema.clone(),
@@ -1796,12 +1809,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
             let mut query_retry_attempts: u32 = 0;
             let mut query_retry_backoff_ms: u64 = 100;
 
-            // Observe the process-wide shutdown signal between pages so a
-            // SIGTERM during a long bounded scan ends the stream at a page
-            // boundary instead of running the table to completion (and
-            // blowing the shutdown budget). Nothing past the last emitted
-            // page is checkpoint-covered, so a restart resumes from the last
-            // finalized cursor. The retry/timeout backoff sleeps below select
+            // Observe the process-wide shutdown signal between pages and
+            // between a page's chunks (`emit_page`) so a SIGTERM during a long
+            // bounded scan ends the stream early instead of running the table
+            // to completion (and blowing the shutdown budget). The cursor
+            // only advances past a completed page, so a restart resumes from
+            // the last finalized cursor. The retry/timeout backoff sleeps below select
             // on the same signal — an uncancellable 30s backoff would outlive
             // the shutdown budget all by itself.
             let mut shutdown = streamling_core::shutdown::subscribe();
@@ -1906,7 +1919,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                 };
 
                 match run_result {
-                    Ok(mut stream) => {
+                    Ok(SourcePage { wire_bytes, batches: mut stream }) => {
                         query_retry_attempts = 0;
                         query_retry_backoff_ms = 100;
 
@@ -1930,7 +1943,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 }
                                 Err(e) => {
                                     error!("Error processing ClickHouse batch: {}", e);
-                                    if tx.send(Err(DataFusionError::ArrowError(Box::new(e), None))).await.is_err() {
+                                    if task_wait.send(tx.send(Err(DataFusionError::ArrowError(Box::new(e), None)))).await.is_err() {
                                         warn!("ClickHouseSourceExec: receiver dropped while sending error");
                                     }
                                     stream_failed = true;
@@ -1961,12 +1974,12 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 // split further. Surface it rather than silently skip
                                 // data — a key exceeding MAX_PAGE_BYTES alone would
                                 // overflow Arrow's per-array limit.
-                                let _ = tx.send(Err(DataFusionError::from(streamling_core::streamling_err!(
+                                let _ = task_wait.send(tx.send(Err(DataFusionError::from(streamling_core::streamling_err!(
                                     "ClickHouse source: range [{}, {}) at min width still exceeds page limits \
                                      (page_size={}, {} rows; max_page_bytes={}, {} bytes)",
                                     range_start, upper_bound, page_size, total_rows_in_page,
                                     MAX_PAGE_BYTES, total_page_bytes
-                                )))).await;
+                                ))))).await;
                                 break;
                             }
                             // Probe the exact row count for this range so the next
@@ -2012,10 +2025,11 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         // Complete page. Emit all buffered batches, emitting one empty
                         // batch for an empty scan so buffered checkpoint messages flow.
                         let mut receiver_dropped = false;
+                        let mut shutdown_mid_page = false;
                         if total_rows_in_page == 0 {
                             info!("[{}] empty scan on range [{}, {})", reference_name, range_start, upper_bound);
                             let empty_batch = attach_checkpoints(RecordBatch::new_empty(empty_batch_schema.clone()));
-                            if tx.send(Ok(empty_batch)).await.is_err() {
+                            if task_wait.send(tx.send(Ok(empty_batch))).await.is_err() {
                                 receiver_dropped = true;
                             }
                         } else {
@@ -2048,13 +2062,13 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                             }
                                             Ok(deduped) => (vec![deduped], false),
                                             Err(e) => {
-                                                let _ = tx
+                                                let _ = task_wait.send(tx
                                                     .send(Err(DataFusionError::from(
                                                         streamling_err!(
                                                             "ClickHouse source dedup failed: {}",
                                                             e
                                                         ),
-                                                    )))
+                                                    ))))
                                                     .await;
                                                 break;
                                             }
@@ -2070,7 +2084,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                 let empty_batch = attach_checkpoints(RecordBatch::new_empty(
                                     empty_batch_schema.clone(),
                                 ));
-                                if tx.send(Ok(empty_batch)).await.is_err() {
+                                if task_wait.send(tx.send(Ok(empty_batch))).await.is_err() {
                                     receiver_dropped = true;
                                 }
                             } else {
@@ -2088,25 +2102,25 @@ impl ExecutionPlan for ClickHouseSourceExec {
                                     {
                                         Ok(p) => emit_batches = p,
                                         Err(e) => {
-                                            let _ = tx.send(Err(e)).await;
+                                            let _ = task_wait.send(tx.send(Err(e))).await;
                                             break;
                                         }
                                     }
                                 }
-                                for batch in emit_batches.into_iter() {
-                                    for chunk in chunk_record_batch(batch, record_batch_size) {
-                                        // attach_checkpoints drains the buffered messages onto
-                                        // the first chunk it sees (and no-ops once empty), so
-                                        // checkpoint messages still ride exactly one emitted
-                                        // batch — the first chunk of the page.
-                                        let chunk = attach_checkpoints(chunk);
-                                        if tx.send(Ok(chunk)).await.is_err() {
-                                            receiver_dropped = true;
-                                            break;
-                                        }
-                                    }
-                                    if receiver_dropped {
-                                        break;
+                                match emit_page(
+                                    emit_batches,
+                                    record_batch_size,
+                                    &tx,
+                                    &task_wait,
+                                    &shutdown,
+                                    &attach_checkpoints,
+                                )
+                                .await
+                                {
+                                    PageEmission::Complete => {}
+                                    PageEmission::ReceiverDropped => receiver_dropped = true,
+                                    PageEmission::ShutdownRequested => {
+                                        shutdown_mid_page = true;
                                     }
                                 }
                             }
@@ -2115,6 +2129,21 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             warn!("ClickHouseSourceExec: receiver dropped during page {}", page_count);
                             break;
                         }
+                        if shutdown_mid_page {
+                            // The cursor stays at this page's start, so a
+                            // restart re-reads the page.
+                            info!(
+                                "[{}] shutdown requested; ending bounded scan mid-page {}",
+                                reference_name, page_count
+                            );
+                            break;
+                        }
+
+                        // Only a fully emitted page counts what it pulled in: an overflowed or
+                        // abandoned page is re-read, and that read counts instead. Rows count
+                        // before the version dedup above, so the source's wrapper does not.
+                        metrics_recorder.record_count("input_bytes_delta", wire_bytes as u64, &metric_metadata_id);
+                        metrics_recorder.record_input_rows_count(total_rows_in_page as u64, &metric_metadata_id);
 
                         // Completed range: advance the cursor and persist it. on_complete
                         // moves range_start past this range; the while condition (is_done)
@@ -2146,10 +2175,14 @@ impl ExecutionPlan for ClickHouseSourceExec {
                             page_count -= 1;
                             // Shutdown-aware backoff: fall through to the
                             // loop-top check as soon as the signal flips.
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_millis(1_000)) => {}
-                                _ = shutdown.changed() => {}
-                            }
+                            task_wait
+                                .wait_input(async {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(Duration::from_millis(1_000)) => {}
+                                        _ = shutdown.changed() => {}
+                                    }
+                                })
+                                .await;
                             continue;
                         }
 
@@ -2171,10 +2204,14 @@ impl ExecutionPlan for ClickHouseSourceExec {
                         // Shutdown-aware backoff: a full 30s uncancellable
                         // sleep would outlive the shutdown budget on its own;
                         // fall through to the loop-top check on signal.
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-                            _ = shutdown.changed() => {}
-                        }
+                        task_wait
+                            .wait_input(async {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+                                    _ = shutdown.changed() => {}
+                                }
+                            })
+                            .await;
                         query_retry_backoff_ms = std::cmp::min(query_retry_backoff_ms.saturating_mul(2), 30_000);
                         continue;
                     }
@@ -2205,7 +2242,7 @@ impl ExecutionPlan for ClickHouseSourceExec {
                     empty_batch_schema.clone(),
                 );
                 if let Some(batch) = flush_batch
-                    && tx.send(Ok(batch)).await.is_err()
+                    && task_wait.send(tx.send(Ok(batch))).await.is_err()
                 {
                     warn!(
                         "ClickHouseSourceExec: receiver dropped before final checkpoint flush for {}",
@@ -2250,15 +2287,54 @@ fn chunk_record_batch(batch: RecordBatch, max_rows: usize) -> Vec<RecordBatch> {
         .collect()
 }
 
+/// How [`emit_page`] ended.
+#[derive(Debug, PartialEq)]
+enum PageEmission {
+    Complete,
+    ShutdownRequested,
+    ReceiverDropped,
+}
+
+/// Send a page's batches downstream in `record_batch_size` chunks.
+///
+/// Stops before the next chunk once shutdown is requested: one page can hold
+/// `page_size` rows (10M by default), and draining them all through a slow
+/// sink outlives the shutdown budget. The check runs before
+/// `attach_checkpoints`, so no buffered checkpoint message is dropped.
+async fn emit_page(
+    batches: Vec<RecordBatch>,
+    record_batch_size: usize,
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    task_wait: &TaskWaitHandle,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+    attach_checkpoints: impl Fn(RecordBatch) -> RecordBatch,
+) -> PageEmission {
+    for batch in batches {
+        for chunk in chunk_record_batch(batch, record_batch_size) {
+            if *shutdown.borrow() {
+                return PageEmission::ShutdownRequested;
+            }
+            // attach_checkpoints drains the buffered messages onto the first
+            // chunk it sees (and no-ops once empty), so checkpoint messages
+            // ride exactly one emitted batch.
+            if task_wait
+                .send(tx.send(Ok(attach_checkpoints(chunk))))
+                .await
+                .is_err()
+            {
+                return PageEmission::ReceiverDropped;
+            }
+        }
+    }
+    PageEmission::Complete
+}
+
 impl ClickHouseSourceExec {
     pub async fn run(
         client: ClickHouseClient,
         query: &str,
         limit: Option<usize>,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = arrow::error::Result<RecordBatch>> + Send>>,
-        DataFusionError,
-    > {
+    ) -> Result<SourcePage, DataFusionError> {
         let query = format!(
             "{} {} FORMAT Arrow",
             query,
@@ -2273,10 +2349,14 @@ impl ClickHouseSourceExec {
             .process_http_response(response_result, query.as_str(), "run")
             .await?;
 
+        let wire_bytes = response_bytes.len();
         let batches = decode_arrow_ipc_blocking(client, response_bytes, query).await;
 
         trace!("Created async record batch stream");
-        Ok(Box::pin(futures::stream::iter(batches)))
+        Ok(SourcePage {
+            wire_bytes,
+            batches: Box::pin(futures::stream::iter(batches)),
+        })
     }
 
     pub fn extract_keyset_from_batch(
@@ -2306,6 +2386,13 @@ impl ClickHouseSourceExec {
 
         Ok(keyset_values)
     }
+}
+
+/// One page read from a ClickHouse source query.
+pub struct SourcePage {
+    /// Bytes of the HTTP response body the page was decoded from.
+    pub wire_bytes: usize,
+    pub batches: Pin<Box<dyn Stream<Item = arrow::error::Result<RecordBatch>> + Send>>,
 }
 
 /// Decodes a ClickHouse Arrow IPC response on the blocking pool, so a large page
@@ -2880,8 +2967,8 @@ impl ClickHouseClient {
                 }
 
                 let normalized_type = match field.data_type() {
-                    DataType::Utf8View => DataType::Utf8,
-                    DataType::BinaryView => DataType::Binary,
+                    DataType::Utf8View => DataType::LargeUtf8,
+                    DataType::BinaryView => DataType::LargeBinary,
                     other => other.clone(),
                 };
 
@@ -2962,13 +3049,13 @@ impl ClickHouseClient {
                 let column = &batch.columns()[idx];
                 let original_field = &original_schema.fields()[idx];
                 match (original_field.data_type(), normalized_field.data_type()) {
-                    (DataType::Utf8View, DataType::Utf8) => {
-                        Ok(cast(column.as_ref(), &DataType::Utf8)
-                            .streamling_context("failed to cast Utf8View to Utf8")?)
+                    (DataType::Utf8View, DataType::LargeUtf8) => {
+                        Ok(cast(column.as_ref(), &DataType::LargeUtf8)
+                            .streamling_context("failed to cast Utf8View to LargeUtf8")?)
                     }
-                    (DataType::BinaryView, DataType::Binary) => {
-                        Ok(cast(column.as_ref(), &DataType::Binary)
-                            .streamling_context("failed to cast BinaryView to Binary")?)
+                    (DataType::BinaryView, DataType::LargeBinary) => {
+                        Ok(cast(column.as_ref(), &DataType::LargeBinary)
+                            .streamling_context("failed to cast BinaryView to LargeBinary")?)
                     }
                     // The FSB(32)+U256/I256 endian-flip arm is gone —
                     // no source produces those
@@ -4064,6 +4151,66 @@ mod tests {
         make_int64_batch_with_meta(n, None)
     }
 
+    #[tokio::test]
+    async fn emit_page_stops_before_the_next_chunk_once_shutdown_is_requested() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // The emitter owns `tx`, so the channel closes when it returns.
+        let emitter = async move {
+            emit_page(
+                vec![make_int64_batch(100)],
+                10,
+                &tx,
+                &TaskWaitHandle::default(),
+                &shutdown_rx,
+                |b| b,
+            )
+            .await
+        };
+        let consumer = async {
+            rx.recv().await.expect("first chunk").expect("ok chunk");
+            shutdown_tx.send(true).expect("receiver alive");
+            let mut after_shutdown = 0;
+            while rx.recv().await.is_some() {
+                after_shutdown += 1;
+            }
+            after_shutdown
+        };
+        let (outcome, after_shutdown) = tokio::join!(emitter, consumer);
+
+        assert_eq!(outcome, PageEmission::ShutdownRequested);
+        // At most the chunk already in the channel plus the one blocked in
+        // `send` when the signal flipped — not the 9 left in the page.
+        assert!(
+            after_shutdown <= 2,
+            "{after_shutdown} chunks were emitted after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_page_sends_every_chunk_without_shutdown() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let outcome = emit_page(
+            vec![make_int64_batch(100)],
+            10,
+            &tx,
+            &TaskWaitHandle::default(),
+            &shutdown_rx,
+            |b| b,
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(outcome, PageEmission::Complete);
+        let mut chunks = 0;
+        while rx.recv().await.is_some() {
+            chunks += 1;
+        }
+        assert_eq!(chunks, 10);
+    }
+
     #[test]
     fn chunk_record_batch_splits_evenly() {
         let chunks = chunk_record_batch(make_int64_batch(10), 5);
@@ -4206,16 +4353,16 @@ mod tests {
         // Normalize the schema
         let normalized = ClickHouseClient::normalize_schema_for_clickhouse(&schema);
 
-        // Check that view types are converted
+        // Check that view types are converted to 64-bit Large* types (matching expand_views_at_output)
         assert_eq!(
             normalized.field(0).data_type(),
-            &DataType::Utf8,
-            "Utf8View should be converted to Utf8"
+            &DataType::LargeUtf8,
+            "Utf8View should be converted to LargeUtf8"
         );
         assert_eq!(
             normalized.field(1).data_type(),
-            &DataType::Binary,
-            "BinaryView should be converted to Binary"
+            &DataType::LargeBinary,
+            "BinaryView should be converted to LargeBinary"
         );
         assert_eq!(
             normalized.field(2).data_type(),
@@ -4227,6 +4374,155 @@ mod tests {
         assert_eq!(normalized.field(0).name(), "utf8_view_col");
         assert_eq!(normalized.field(1).name(), "binary_view_col");
         assert_eq!(normalized.field(2).name(), "regular_col");
+    }
+
+    #[test]
+    fn test_normalize_batch_for_clickhouse_casts_views_to_large_types() {
+        use arrow::array::{AsArray, BinaryViewArray, StringViewArray};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringViewArray::from(vec![
+                    Some("0x1234567890abcdef_long_string"),
+                    None,
+                ])),
+                Arc::new(BinaryViewArray::from_iter(vec![
+                    Some(b"0123456789abcdef_long_bytes".as_slice()),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let normalized_schema =
+            Arc::new(ClickHouseClient::normalize_schema_for_clickhouse(&schema));
+        let out =
+            ClickHouseClient::normalize_batch_for_clickhouse(&batch, &normalized_schema).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::LargeUtf8);
+        assert_eq!(out.schema().field(1).data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            out.column(0).as_string::<i64>().value(0),
+            "0x1234567890abcdef_long_string"
+        );
+        assert!(out.column(0).is_null(1));
+        assert_eq!(
+            out.column(1).as_binary::<i64>().value(0),
+            b"0123456789abcdef_long_bytes"
+        );
+        assert!(out.column(1).is_null(1));
+    }
+
+    #[test]
+    fn test_normalize_batch_from_clickhouse_casts_strings_and_binaries_to_views() {
+        use arrow::array::{
+            Array, AsArray, BinaryArray, FixedSizeListArray, LargeStringArray, ListBuilder,
+            StringArray, StringBuilder,
+        };
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder
+            .values()
+            .append_value("nested_topic_long_value");
+        list_builder.append(true);
+        list_builder.append_null();
+
+        let fsl_values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("fixed_slot_a_long_value"),
+            Some("fixed_slot_b_long_value"),
+            None,
+            None,
+        ]));
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            fsl_values,
+            None,
+        )
+        .unwrap();
+
+        let ch_schema = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::LargeUtf8, true),
+            Field::new("raw", DataType::Binary, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 2),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            ch_schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![
+                    Some("0x1234567890abcdef_calldata"),
+                    None,
+                ])),
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"0123456789abcdef_raw".as_slice()),
+                    None,
+                ])),
+                Arc::new(list_builder.finish()),
+                Arc::new(fsl),
+            ],
+        )
+        .unwrap();
+
+        let target = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("element", DataType::Utf8View, true)),
+                    2,
+                ),
+                true,
+            ),
+        ]));
+
+        let out = ClickHouseClient::normalize_batch_from_clickhouse(&batch, &target).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8View);
+        assert_eq!(out.schema().field(1).data_type(), &DataType::BinaryView);
+        assert_eq!(
+            out.column(0).as_string_view().value(0),
+            "0x1234567890abcdef_calldata"
+        );
+        assert!(out.column(0).is_null(1));
+        assert_eq!(
+            out.column(1).as_binary_view().value(0),
+            b"0123456789abcdef_raw"
+        );
+        assert!(out.column(1).is_null(1));
+        let list = out.column(2).as_list::<i32>();
+        assert_eq!(
+            list.values().as_string_view().value(0),
+            "nested_topic_long_value"
+        );
+        assert!(list.is_null(1));
+        let pair = out.column(3).as_fixed_size_list();
+        assert_eq!(
+            pair.values().as_string_view().value(0),
+            "fixed_slot_a_long_value"
+        );
+        assert_eq!(
+            pair.values().as_string_view().value(1),
+            "fixed_slot_b_long_value"
+        );
+        assert!(pair.values().is_null(2));
     }
 
     #[test]
@@ -5445,6 +5741,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
 
         let arrow_bytes = create_test_arrow_ipc_bytes(&[1, 2, 3]);
+        let response_len = arrow_bytes.len();
         let _mock = server
             .mock("GET", "/")
             .match_query(mockito::Matcher::Any)
@@ -5457,7 +5754,12 @@ mod tests {
         let result = ClickHouseSourceExec::run(client, "SELECT id FROM test_table", None).await;
         assert!(result.is_ok(), "run() should succeed with valid Arrow IPC");
 
-        let mut stream = result.unwrap();
+        let page = result.unwrap();
+        assert_eq!(
+            page.wire_bytes, response_len,
+            "wire bytes = response body length"
+        );
+        let mut stream = page.batches;
         let mut row_count = 0;
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.expect("batch should be valid");
@@ -5654,7 +5956,10 @@ mod tests {
         for _ in 0..max_test_attempts {
             match ClickHouseSourceExec::run(client.clone(), "SELECT id FROM test_table", None).await
             {
-                Ok(mut stream) => {
+                Ok(SourcePage {
+                    batches: mut stream,
+                    ..
+                }) => {
                     query_retry_attempts = 0;
                     query_retry_backoff_ms = 100;
 
@@ -6535,19 +6840,22 @@ pub fn clickhouse_decimal_to_decimal_arb(
 }
 
 /// Rebuild a ClickHouse column (`source` describes it) so that every
-/// `decimal_arb` or retired wide-int leaf `target` declares, at any depth
-/// under lists and structs, holds the target's encoding. A `decimal_arb` leaf
-/// arrives as native `UInt256`/`Int256` (hinted targets), `Decimal(p, s)` or
-/// decimal text. Struct fields are reordered to the target's order, matched by
-/// name. Containers on a changed path adopt the target's field, so the item vs
-/// element naming and widened nullability match the target.
-/// `None` when nothing below `target` needs converting or reordering.
+/// `decimal_arb`, retired wide-int, or `Utf8View`/`BinaryView` leaf `target`
+/// declares, at any depth under lists and structs, holds the target's encoding.
+/// A `decimal_arb` leaf arrives as native `UInt256`/`Int256` (hinted targets),
+/// `Decimal(p, s)` or decimal text; a view target arrives as `Utf8`/`LargeUtf8`
+/// or `Binary`/`LargeBinary`. Struct fields are reordered to the target's
+/// order, matched by name. Containers on a changed path adopt the target's
+/// field, so the item vs element naming and widened nullability match the
+/// target. `None` when nothing below `target` needs converting or reordering.
 fn clickhouse_column_to_target(
     column: &ArrayRef,
     source: &arrow::datatypes::Field,
     target: &FieldRef,
 ) -> streamling_core::error::Result<Option<(ArrayRef, FieldRef)>> {
-    use arrow::array::{Array, AsArray, LargeListArray, ListArray, StructArray};
+    use arrow::array::{
+        Array, AsArray, FixedSizeListArray, LargeListArray, ListArray, StructArray,
+    };
     use arrow::datatypes::{DataType, Field};
     use streamling_core::types::decimal_arb::DecimalArbType;
     use streamling_core::types::decimal_arb_legacy::legacy_wide_int_kind;
@@ -6580,6 +6888,18 @@ fn clickhouse_column_to_target(
     }
 
     let rebuilt: ArrayRef = match (column.data_type(), target.data_type()) {
+        (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+        | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => {
+            arrow::compute::cast(column.as_ref(), target.data_type()).map_err(|e| {
+                streamling_err!(
+                    "column '{}': failed to cast {:?} to {:?}: {}",
+                    target.name(),
+                    column.data_type(),
+                    target.data_type(),
+                    e
+                )
+            })?
+        }
         (DataType::List(s), DataType::List(t)) => {
             let list = column.as_list::<i32>();
             let Some((values, child)) = clickhouse_column_to_target(list.values(), s, t)? else {
@@ -6600,6 +6920,18 @@ fn clickhouse_column_to_target(
             Arc::new(LargeListArray::try_new(
                 child,
                 list.offsets().clone(),
+                values,
+                list.nulls().cloned(),
+            )?)
+        }
+        (DataType::FixedSizeList(s, size), DataType::FixedSizeList(t, _)) => {
+            let list = column.as_fixed_size_list();
+            let Some((values, child)) = clickhouse_column_to_target(list.values(), s, t)? else {
+                return Ok(None);
+            };
+            Arc::new(FixedSizeListArray::try_new(
+                child,
+                *size,
                 values,
                 list.nulls().cloned(),
             )?)

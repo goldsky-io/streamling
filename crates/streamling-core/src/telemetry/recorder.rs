@@ -1,8 +1,11 @@
+use crate::telemetry::arrow_bytes::batch_data_bytes;
 use crate::telemetry::types::{
     MetricData, RowCountMeasurementType, create_count_with_value, create_gauge_with_value,
     create_time_from_duration,
 };
 use crate::telemetry::{PipelineMetricMetadata, TopologyNodeType, get_global_metric_tags};
+use datafusion::arrow::error::ArrowError;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::metrics::{Count, MetricValue, MetricsSet};
 use once_cell::sync::Lazy;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
@@ -61,6 +64,40 @@ fn is_metric_denied(metric_name: &str) -> bool {
 /// wall-clock suppression (via `resolve_is_sql_node`) and the subtree-delta
 /// export in `record_execution_plan_metrics`; the two must never drift apart.
 const SQL_OPERATOR_TYPE: &str = "sql";
+
+/// `input_rows` and its delta twin `input_rows_delta`: the rows entering a node. Every node that
+/// counts input rows emits both, so the two series always measure the same rows.
+fn input_rows_values(rows: &Count) -> Vec<MetricValue> {
+    vec![
+        MetricValue::Count {
+            name: "input_rows".into(),
+            count: rows.clone(),
+        },
+        MetricValue::Count {
+            name: "input_rows_delta".into(),
+            count: rows.clone(),
+        },
+    ]
+}
+
+/// A `name` count of the Arrow bytes of `batch`. A batch that cannot be sized emits nothing
+/// rather than a wrong number.
+fn data_bytes_metric(
+    name: &'static str,
+    batch: &RecordBatch,
+    metadata_id: &str,
+) -> Option<MetricValue> {
+    match batch_data_bytes(batch) {
+        Ok(bytes) => Some(MetricValue::Count {
+            name: name.into(),
+            count: create_count_with_value(bytes),
+        }),
+        Err(e) => {
+            warn!("Skipping {name} for {metadata_id}: cannot size the batch: {e}");
+            None
+        }
+    }
+}
 
 /// Prefix for metric names sourced from a SQL transform's DataFusion subtree
 /// (`subtree_delta_metric_values`). Namespacing them keeps operator-internal
@@ -390,6 +427,84 @@ impl MetricsRecorder {
         }
     }
 
+    /// Records `input_rows` and `input_rows_delta` for a source that counts the rows it pulls in
+    /// itself, because it drops rows before its wrapper sees them.
+    pub fn record_input_rows_count(&self, value: u64, metadata_id: &str) {
+        let Some(metric_metadata_tags) = self
+            .metric_metadata_tags_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(metadata_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.record_metric_data(MetricData::new_with_owned_tags(
+            input_rows_values(&create_count_with_value(value as usize)),
+            metric_metadata_tags,
+        ));
+    }
+
+    /// Records a confirmed sink write of `delivered_rows` rows of `batch`: `output_rows`,
+    /// `output_rows_delta` and `output_bytes_delta`. Call it only after the destination
+    /// confirmed the write.
+    pub fn record_sink_write(&self, batch: &RecordBatch, delivered_rows: u64, metadata_id: &str) {
+        self.record_sink_delivery(
+            delivered_rows,
+            batch.num_rows() as u64,
+            batch_data_bytes(batch),
+            metadata_id,
+        );
+    }
+
+    /// [`Self::record_sink_write`] for a batch sized with [`batch_data_bytes`] before the sink
+    /// gave it away: `delivered_rows` of its `batch_rows` rows landed. A partial delivery counts
+    /// the same share of the bytes.
+    pub fn record_sink_delivery(
+        &self,
+        delivered_rows: u64,
+        batch_rows: u64,
+        batch_bytes: Result<usize, ArrowError>,
+        metadata_id: &str,
+    ) {
+        self.record_output_rows_count(delivered_rows, metadata_id);
+        let batch_bytes = match batch_bytes {
+            Ok(bytes) => bytes as u64,
+            Err(e) => {
+                warn!("Skipping output_bytes_delta for {metadata_id}: cannot size the batch: {e}");
+                return;
+            }
+        };
+        let bytes = if delivered_rows >= batch_rows {
+            batch_bytes
+        } else {
+            (batch_bytes as u128 * delivered_rows as u128 / batch_rows as u128) as u64
+        };
+        if bytes > 0 {
+            self.record_count("output_bytes_delta", bytes, metadata_id);
+        }
+    }
+
+    /// Records the Arrow bytes of `batch` as the `name` counter. Used for the
+    /// `input_bytes_delta` of a plugin source, which has no wire bytes.
+    pub fn record_data_bytes(&self, name: &'static str, batch: &RecordBatch, metadata_id: &str) {
+        let Some(metric_metadata_tags) = self
+            .metric_metadata_tags_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(metadata_id)
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(bytes) = data_bytes_metric(name, batch, metadata_id) {
+            self.record_metric_data(MetricData::new_with_owned_tags(
+                vec![bytes],
+                metric_metadata_tags,
+            ));
+        }
+    }
+
     pub fn record_elapsed_compute(&self, duration: Duration, metadata_id: &str) {
         let tags_opt = self
             .metric_metadata_tags_registry
@@ -432,7 +547,10 @@ impl MetricsRecorder {
             .get(metadata_id)
             .cloned();
         if metric_metadata_tags.is_none() {
-            warn!(
+            // Per-batch callers (`node_wait`, `node_empty_batches`) hit this for
+            // every emission, so log at debug like the silent skip in
+            // `record_execution_plan_metrics` instead of flooding WARN.
+            debug!(
                 "record_count_w_tags: metadata_id '{}' not found in registry, skipping metric '{}'",
                 metadata_id, name
             );
@@ -604,13 +722,14 @@ impl MetricsRecorder {
     /// This method dispatches count recorded as part of `TelemetryExec` wrapping of `ExecutionPlan`s
     /// for sources, transforms the `batch_count` is recorded as `output_rows` metric
     /// for sinks the `batch_count` is recorded as `input_rows` metric since we wrap the input stream in `TelemetryDataSink`
+    /// for sources, `SourceInputRowCount` records the rows pulled in (before the filter) as `input_rows`
     /// Datafusion's `ExecutionPlanMetricsSet` is also recorded but only for transforms
     /// for transforms, we also emit `batch_count` as children node's `input_row` count
     /// under the assumption that output for a transform node is input for it's downstream nodes
     pub(crate) fn record_execution_plan_metrics(
         &self,
         metadata_id: &str,
-        batch_count: usize,
+        batch: &RecordBatch,
         measurement_type: RowCountMeasurementType,
         execution_plan_metrics: Option<&MetricsSet>,
     ) {
@@ -634,6 +753,7 @@ impl MetricsRecorder {
         }
         let metric_metadata = metric_metadata.unwrap();
         let metric_metadata_tags = metric_metadata_tags.unwrap();
+        let batch_count = batch.num_rows();
         let mut all_metric_data: Vec<MetricData> = Vec::new();
         match measurement_type {
             RowCountMeasurementType::OutputRowCount => {
@@ -680,26 +800,19 @@ impl MetricsRecorder {
                         .get(child_metric_metadata_id.as_str())
                         .cloned()
                     {
-                        let metric_value = MetricValue::Count {
-                            name: "input_rows".into(),
-                            count: output_rows_count.clone(),
-                        };
                         all_metric_data.push(MetricData::new_with_owned_tags(
-                            vec![metric_value],
+                            input_rows_values(&output_rows_count),
                             child_metric_metadata_tags,
                         ));
                     }
                 }
             }
-            RowCountMeasurementType::InputRowCount => {
-                let input_rows_count = Count::new();
-                input_rows_count.add(batch_count);
-                let input_rows_metric_value = MetricValue::Count {
-                    name: "input_rows".into(),
-                    count: input_rows_count,
-                };
+            // A sink's received rows, or the rows a source pulls in before its filter (source
+            // input bytes are wire bytes, recorded by each connector).
+            RowCountMeasurementType::InputRowCount
+            | RowCountMeasurementType::SourceInputRowCount => {
                 all_metric_data.push(MetricData::new_with_owned_tags(
-                    vec![input_rows_metric_value],
+                    input_rows_values(&create_count_with_value(batch_count)),
                     metric_metadata_tags.clone(),
                 ));
             }
@@ -1022,243 +1135,10 @@ pub fn initialize_metrics_recorder(
 
     let mut instance = METRICS_RECORDER_INSTANCE.lock().unwrap();
     if instance.is_none() {
-        let meter = get_meter();
-        let delta_meter = crate::telemetry::get_delta_meter();
-        let mut count_registry: HashMap<String, Counter<u64>> = HashMap::new();
-        let mut gauge_registry: HashMap<String, Gauge<u64>> = HashMap::new();
-        let mut histogram_registry: HashMap<String, Histogram<u64>> = HashMap::new();
-
-        let output_rows_name = add_service_prefix("output_rows");
-        count_registry.insert(String::from("output_rows"), meter
-            .u64_counter(output_rows_name)
-            .with_description(
-                "Indicates the number of rows produced as output from a specific query execution.",
-            )
-            .build());
-
-        let output_rows_delta_name = add_service_prefix("output_rows_delta");
-        debug!("Creating output_rows_delta counter with delta meter");
-        count_registry.insert(String::from("output_rows_delta"), delta_meter
-            .u64_counter(output_rows_delta_name)
-            .with_description(
-                "Indicates the number of rows produced as output from a specific query execution (Delta temporality).",
-            )
-            .build());
-
-        let input_rows_name = add_service_prefix("input_rows");
-        count_registry.insert(String::from("input_rows"), meter
-            .u64_counter(input_rows_name)
-            .with_description(
-                "Indicates the number of rows produced as output from a specific query execution.",
-            )
-            .build());
-
-        let elapsed_compute_name = add_service_prefix("elapsed_compute");
-        histogram_registry.insert(
-            String::from("elapsed_compute"),
-            meter
-                .u64_histogram(elapsed_compute_name)
-                .with_description(
-                    "Total time taken to execute the query execution plan on the data",
-                )
-                .with_unit("ms")
-                .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
-                .build(),
-        );
-
-        count_registry.insert(
-            String::from("http_requests"),
-            meter
-                .u64_counter(add_service_prefix("http_requests"))
-                .with_description(
-                    "Number of outbound HTTP request attempts by handler or webhook node",
-                )
-                .build(),
-        );
-        count_registry.insert(
-            String::from("http_retries"),
-            meter
-                .u64_counter(add_service_prefix("http_retries"))
-                .with_description("Number of outbound HTTP request attempts that will be retried")
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("http_request_latency"),
-            meter
-                .u64_histogram(add_service_prefix("http_request_latency"))
-                .with_description("Latency of each outbound HTTP request attempt")
-                .with_unit("ms")
-                .with_boundaries(vec![
-                    10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
-                    30_000.0, 60_000.0, 120_000.0, 300_000.0,
-                ])
-                .build(),
-        );
-
-        // Checkpoint metrics - Counters
-        count_registry.insert(
-            String::from("checkpoint_epochs_succeeded"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_epochs_succeeded"))
-                .with_description("Number of checkpoint epochs that completed successfully")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_epochs_failed"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_epochs_failed"))
-                .with_description(
-                    "Number of checkpoint epochs that failed: mid-flight timeout, or a \
-                     terminal epoch that never finalized before teardown (tail replays)",
-                )
-                .build(),
-        );
-        count_registry.insert(
-            String::from("shutdown_unflushed_plugin_dispatchers"),
-            meter
-                .u64_counter(add_service_prefix("shutdown_unflushed_plugin_dispatchers"))
-                .with_description(
-                    "Plugin dispatchers the shutdown drain gave up on before they confirmed \
-                     a flush; their unflushed tails replay on restart",
-                )
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_markers_sent"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_markers_sent"))
-                .with_description("Number of checkpoint markers broadcast by coordinator")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_acks_received"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_acks_received"))
-                .with_description("Number of checkpoint acknowledgments received by coordinator")
-                .build(),
-        );
-        count_registry.insert(
-            String::from("checkpoint_finalizers_sent"),
-            meter
-                .u64_counter(add_service_prefix("checkpoint_finalizers_sent"))
-                .with_description("Number of checkpoint finalizers broadcast by coordinator")
-                .build(),
-        );
-        // Checkpoint metrics - Gauges
-        gauge_registry.insert(
-            String::from("checkpoint_epochs_in_flight"),
-            meter
-                .u64_gauge(add_service_prefix("checkpoint_epochs_in_flight"))
-                .with_description("Number of checkpoint epochs currently in progress")
-                .build(),
-        );
-
-        // Checkpoint metrics - Histograms
-        // Note: OTel Prometheus exporter appends the unit as a suffix (e.g., "_milliseconds"),
-        // so we use .with_unit("ms") and omit "_ms" from the metric name.
-        //
-        // Explicit boundaries in ms: 100ms to 1 hour.
-        // Default OTel boundaries max out at 10s, which is too low for checkpoint metrics
-        // that can take minutes or hours.
-        let duration_boundaries_ms: Vec<f64> = DURATION_MS_BOUNDARIES.to_vec();
-
-        histogram_registry.insert(
-            String::from("checkpoint_epoch_duration"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_epoch_duration"))
-                .with_description("Time between consecutive epoch finalizations")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_marker_arrival"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_marker_arrival"))
-                .with_description("Time from checkpoint marker creation to arrival at a node")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_sink_flush"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_sink_flush"))
-                .with_description("Time from sink receiving checkpoint marker to completing flush and sending ack")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_finalization_wait"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_finalization_wait"))
-                .with_description(
-                    "Time producer spends blocked waiting for previous epoch to finalize",
-                )
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("checkpoint_per_sink_ack_latency"),
-            meter
-                .u64_histogram(add_service_prefix("checkpoint_per_sink_ack_latency"))
-                .with_description("Per-sink time from epoch creation to ack arrival")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-
-        // Event-time freshness metrics — gauge of running max event_time per
-        // source, plus per-row lag (t_emit - event_time). Reuses the
-        // checkpoint duration boundaries; tune in a follow-up after
-        // observing real-data distribution.
-        gauge_registry.insert(
-            String::from("event_time_watermark"),
-            meter
-                .u64_gauge(add_service_prefix("event_time_watermark"))
-                .with_description("Running max event_time observed by source, unix milliseconds")
-                .with_unit("ms")
-                .build(),
-        );
-        histogram_registry.insert(
-            String::from("event_time_lag"),
-            meter
-                .u64_histogram(add_service_prefix("event_time_lag"))
-                .with_description("Per-row t_emit - event_time, milliseconds")
-                .with_unit("ms")
-                .with_boundaries(duration_boundaries_ms.clone())
-                .build(),
-        );
-        let mut metric_metadata_tags_registry = HashMap::new();
-        // caching tags for each metric metadata so that we don't have to compute them everytime metric is recorded
-        for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
-            metric_metadata_tags_registry.insert(metric_metadata_id, metric_metadata.to_tags());
-        }
-        let service_instance_id = metric_metadata_registry
-            .values()
-            .next()
-            .expect("expect at least one metric metadata to be available")
-            .service_instance_id
-            .clone();
-        // Series seeding happens later, via `seed_elapsed_compute_series`,
-        // once plugin-declared identity labels have been merged.
-        let recorder = Arc::new(MetricsRecorder {
-            service_instance_id,
-            metric_metadata_registry: Mutex::new(metric_metadata_registry),
-            metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
-            count_registry: Mutex::new(count_registry),
-            gauge_registry: Mutex::new(gauge_registry),
-            histogram_registry: Mutex::new(histogram_registry),
-            ..Default::default()
-        });
-        *instance = Some(recorder);
+        *instance = Some(Arc::new(build_metrics_recorder(metric_metadata_registry)));
     } else {
         debug!("MetricsRecorder already initialized; merging metric metadata registry.");
-        // Merge new metadata into existing recorder so subsequent pipelines
-        // are tracked. Series seeding for the new nodes happens later via
-        // `seed_elapsed_compute_series` (idempotent per node id).
+        // Merge new metadata into existing recorder so subsequent pipelines are tracked
         if let Some(existing) = instance.as_ref() {
             let mut reg_lock = existing
                 .metric_metadata_registry
@@ -1273,6 +1153,316 @@ pub fn initialize_metrics_recorder(
                 tags_lock.insert(id, meta.to_tags());
             }
         }
+    }
+}
+
+/// Construct a fully-initialized [`MetricsRecorder`] with every metric
+/// pre-registered against the current global meter provider.
+///
+/// Split out of [`initialize_metrics_recorder`] as a pure builder-extraction
+/// refactor so tests can atomically replace the singleton with a freshly built
+/// recorder whose counters are bound to a test-controlled meter provider,
+/// without ever exposing a `None` singleton (see `test_support`).
+///
+/// # Compatibility
+///
+/// This helper registers both `node_wait` and `elapsed_compute`. The poll-time
+/// `elapsed_compute` of a non-SQL node is recorded in `WrappingExec` for
+/// dashboard compatibility; keep that runtime behavior separate from this
+/// registration helper.
+fn build_metrics_recorder(
+    metric_metadata_registry: HashMap<String, PipelineMetricMetadata>,
+) -> MetricsRecorder {
+    let meter = get_meter();
+    let delta_meter = crate::telemetry::get_delta_meter();
+    let mut count_registry: HashMap<String, Counter<u64>> = HashMap::new();
+    let mut gauge_registry: HashMap<String, Gauge<u64>> = HashMap::new();
+    let mut histogram_registry: HashMap<String, Histogram<u64>> = HashMap::new();
+
+    let output_rows_name = add_service_prefix("output_rows");
+    count_registry.insert(
+        String::from("output_rows"),
+        meter
+            .u64_counter(output_rows_name)
+            .with_description(
+                "Indicates the number of rows produced as output from a specific query execution.",
+            )
+            .build(),
+    );
+
+    let output_rows_delta_name = add_service_prefix("output_rows_delta");
+    debug!("Creating output_rows_delta counter with delta meter");
+    count_registry.insert(String::from("output_rows_delta"), delta_meter
+        .u64_counter(output_rows_delta_name)
+        .with_description(
+            "Indicates the number of rows produced as output from a specific query execution (Delta temporality).",
+        )
+        .build());
+
+    let input_rows_name = add_service_prefix("input_rows");
+    count_registry.insert(String::from("input_rows"), meter
+        .u64_counter(input_rows_name)
+        .with_description(
+            "Indicates the number of rows entering a node; a source counts them before its topology filter.",
+        )
+        .build());
+
+    let input_rows_delta_name = add_service_prefix("input_rows_delta");
+    count_registry.insert(String::from("input_rows_delta"), delta_meter
+        .u64_counter(input_rows_delta_name)
+        .with_description(
+            "Indicates the number of rows entering a node; a source counts them before its topology filter (Delta temporality).",
+        )
+        .build());
+
+    count_registry.insert(String::from("input_bytes_delta"), delta_meter
+        .u64_counter(add_service_prefix("input_bytes_delta"))
+        .with_description(
+            "Indicates the bytes a source reads: Kafka payloads, ClickHouse response bodies, file sizes, Arrow bytes for plugins (Delta temporality).",
+        )
+        .build());
+
+    count_registry.insert(
+        String::from("output_bytes_delta"),
+        delta_meter
+            .u64_counter(add_service_prefix("output_bytes_delta"))
+            .with_description(
+                "Indicates the Arrow bytes of the rows a sink receives (Delta temporality).",
+            )
+            .build(),
+    );
+
+    let elapsed_compute_name = add_service_prefix("elapsed_compute");
+    histogram_registry.insert(
+        String::from("elapsed_compute"),
+        meter
+            .u64_histogram(elapsed_compute_name)
+            .with_description("Total time taken to execute the query execution plan on the data")
+            .with_unit("ms")
+            .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
+            .build(),
+    );
+
+    count_registry.insert(
+        String::from("http_requests"),
+        meter
+            .u64_counter(add_service_prefix("http_requests"))
+            .with_description("Number of outbound HTTP request attempts by handler or webhook node")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("http_retries"),
+        meter
+            .u64_counter(add_service_prefix("http_retries"))
+            .with_description("Number of outbound HTTP request attempts that will be retried")
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("http_request_latency"),
+        meter
+            .u64_histogram(add_service_prefix("http_request_latency"))
+            .with_description("Latency of each outbound HTTP request attempt")
+            .with_unit("ms")
+            .with_boundaries(vec![
+                10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+                30_000.0, 60_000.0, 120_000.0, 300_000.0,
+            ])
+            .build(),
+    );
+
+    // Checkpoint metrics - Counters
+    count_registry.insert(
+        String::from("checkpoint_epochs_succeeded"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_epochs_succeeded"))
+            .with_description("Number of checkpoint epochs that completed successfully")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_epochs_failed"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_epochs_failed"))
+            .with_description(
+                "Number of checkpoint epochs that failed: mid-flight timeout, or a \
+                 terminal epoch that never finalized before teardown (tail replays)",
+            )
+            .build(),
+    );
+    count_registry.insert(
+        String::from("shutdown_unflushed_plugin_dispatchers"),
+        meter
+            .u64_counter(add_service_prefix("shutdown_unflushed_plugin_dispatchers"))
+            .with_description(
+                "Plugin dispatchers the shutdown drain gave up on before they confirmed \
+                 a flush; their unflushed tails replay on restart",
+            )
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_markers_sent"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_markers_sent"))
+            .with_description("Number of checkpoint markers broadcast by coordinator")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_acks_received"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_acks_received"))
+            .with_description("Number of checkpoint acknowledgments received by coordinator")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("checkpoint_finalizers_sent"),
+        meter
+            .u64_counter(add_service_prefix("checkpoint_finalizers_sent"))
+            .with_description("Number of checkpoint finalizers broadcast by coordinator")
+            .build(),
+    );
+    // Checkpoint metrics - Gauges
+    gauge_registry.insert(
+        String::from("checkpoint_epochs_in_flight"),
+        meter
+            .u64_gauge(add_service_prefix("checkpoint_epochs_in_flight"))
+            .with_description("Number of checkpoint epochs currently in progress")
+            .build(),
+    );
+
+    // Checkpoint metrics - Histograms
+    // Note: OTel Prometheus exporter appends the unit as a suffix (e.g., "_milliseconds"),
+    // so we use .with_unit("ms") and omit "_ms" from the metric name.
+    //
+    // Explicit boundaries in ms: 100ms to 1 hour.
+    // Default OTel boundaries max out at 10s, which is too low for checkpoint metrics
+    // that can take minutes or hours.
+    let duration_boundaries_ms: Vec<f64> = DURATION_MS_BOUNDARIES.to_vec();
+
+    histogram_registry.insert(
+        String::from("checkpoint_epoch_duration"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_epoch_duration"))
+            .with_description("Time between consecutive epoch finalizations")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_marker_arrival"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_marker_arrival"))
+            .with_description("Time from checkpoint marker creation to arrival at a node")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_sink_flush"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_sink_flush"))
+            .with_description(
+                "Time from sink receiving checkpoint marker to completing flush and sending ack",
+            )
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_finalization_wait"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_finalization_wait"))
+            .with_description("Time producer spends blocked waiting for previous epoch to finalize")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("checkpoint_per_sink_ack_latency"),
+        meter
+            .u64_histogram(add_service_prefix("checkpoint_per_sink_ack_latency"))
+            .with_description("Per-sink time from epoch creation to ack arrival")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+
+    // Event-time freshness metrics — gauge of running max event_time per
+    // source, plus per-row lag (t_emit - event_time). Reuses the
+    // checkpoint duration boundaries; tune in a follow-up after
+    // observing real-data distribution.
+    gauge_registry.insert(
+        String::from("event_time_watermark"),
+        meter
+            .u64_gauge(add_service_prefix("event_time_watermark"))
+            .with_description("Running max event_time observed by source, unix milliseconds")
+            .with_unit("ms")
+            .build(),
+    );
+    histogram_registry.insert(
+        String::from("event_time_lag"),
+        meter
+            .u64_histogram(add_service_prefix("event_time_lag"))
+            .with_description("Per-row t_emit - event_time, milliseconds")
+            .with_unit("ms")
+            .with_boundaries(duration_boundaries_ms.clone())
+            .build(),
+    );
+
+    // Node-wait metric — a monotonic ms counter of a node's time, split by the
+    // `state` tag into the starved/busy/blocked triad:
+    //  - `state="blocked"` — held back by a downstream consumer; an edge
+    //    property, so it also carries `downstream_id` (or "" when unresolved).
+    //    Exactly one emitter per edge: a single-downstream `WrappingExec`'s
+    //    series (yield->resume suspension, or the output send wait of an
+    //    operator that claims its `TaskWaitMeter`), or, for a fan-out
+    //    producer, the `BroadcastStream`'s one edge per consumer
+    //    (blocked-send time). The two layers never coexist for a node, so
+    //    `sum`/`max by (id)` and `... by (downstream_id)` don't double count.
+    //  - `state="starved"` — waiting for input; node-local, so `downstream_id`
+    //    is "".
+    //  - `state="busy"` — the node's own work; node-local.
+    // All states share an identical label key set. The OTel Prometheus
+    // exporter appends unit/`_total`, giving
+    // `streamling_node_wait_milliseconds_total`.
+    count_registry.insert(
+        String::from("node_wait"),
+        meter
+            .u64_counter(add_service_prefix("node_wait"))
+            .with_description(
+                "Time a node spends in each state of the state tag: busy (its own work), starved (waiting for input) or blocked (held back by a downstream consumer, attributed via downstream_id), milliseconds",
+            )
+            .with_unit("ms")
+            .build(),
+    );
+    count_registry.insert(
+        String::from("node_empty_batches"),
+        meter
+            .u64_counter(add_service_prefix("node_empty_batches"))
+            .with_description(
+                "Zero-row data batches a node emitted; batches that only carry checkpoint messages are not counted",
+            )
+            .build(),
+    );
+    let mut metric_metadata_tags_registry = HashMap::new();
+    // caching tags for each metric metadata so that we don't have to compute them everytime metric is recorded
+    for (metric_metadata_id, metric_metadata) in metric_metadata_registry.clone() {
+        metric_metadata_tags_registry.insert(metric_metadata_id, metric_metadata.to_tags());
+    }
+    let service_instance_id = metric_metadata_registry
+        .values()
+        .next()
+        .expect("expect at least one metric metadata to be available")
+        .service_instance_id
+        .clone();
+    // Series seeding happens later, via `seed_elapsed_compute_series`,
+    // once plugin-declared identity labels have been merged.
+    MetricsRecorder {
+        service_instance_id,
+        metric_metadata_registry: Mutex::new(metric_metadata_registry),
+        metric_metadata_tags_registry: Mutex::new(metric_metadata_tags_registry),
+        count_registry: Mutex::new(count_registry),
+        gauge_registry: Mutex::new(gauge_registry),
+        histogram_registry: Mutex::new(histogram_registry),
+        ..Default::default()
     }
 }
 
@@ -1490,6 +1680,12 @@ impl ControlPlaneMetricsRecorder {
             .record_count_w_tags(name, value, vec![], &self.component_id);
     }
 
+    /// Record a counter metric with extra tags.
+    pub fn record_count_w_tags(&self, name: &str, value: u64, tags: Vec<(&str, &str)>) {
+        self.inner
+            .record_count_w_tags(name, value, tags, &self.component_id);
+    }
+
     /// Record a gauge metric.
     pub fn record_gauge(&self, name: &str, value: u64) {
         self.inner
@@ -1544,6 +1740,285 @@ pub fn get_control_plane_metrics_recorder(component_id: &str) -> Arc<ControlPlan
     recorder
 }
 
+/// Crate-internal test harness for observing emitted metric values.
+///
+/// The production emission path funnels every counter through the global OTEL
+/// meter provider, which is a no-op unless an SDK provider is installed — so a
+/// unit test cannot otherwise read back what `record_*` emitted. This module
+/// installs an in-process [`ManualReader`]-backed provider once, and exposes a
+/// helper to (re)build the recorder singleton bound to it plus a `node_wait`
+/// collect/sum helper.
+///
+/// Concurrency contract: every test that mutates the global recorder singleton
+/// or reads emitted metrics MUST hold [`TEST_LOCK`] for its duration. The
+/// recorder is a process-global singleton and the meter provider is
+/// process-global; the shared lock is the only thing preventing one test's
+/// reset from being observed as a half-built recorder by another.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{METRICS_RECORDER_INSTANCE, build_metrics_recorder};
+    use crate::node_context::{NodeContext, TopologyNodeType};
+    use crate::telemetry::PipelineMetricMetadata;
+    use opentelemetry::global;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::reader::MetricReader;
+    use opentelemetry_sdk::metrics::{
+        InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Temporality,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    use std::time::Duration;
+
+    /// Serializes every test across the crate that mutates the global recorder
+    /// singleton or the global meter provider (recorder tests, `WrappingExec`
+    /// runtime tests, `BroadcastStream` runtime tests).
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `ManualReader` is not `Clone`, but `SdkMeterProvider::with_reader` takes
+    /// the reader by value while we also need a handle to call `collect`. Share
+    /// one reader behind an `Arc` via this thin delegating wrapper.
+    #[derive(Debug, Clone)]
+    struct SharedReader(Arc<ManualReader>);
+
+    impl MetricReader for SharedReader {
+        fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+            self.0.register_pipeline(pipeline);
+        }
+        fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
+            self.0.collect(rm)
+        }
+        fn force_flush(&self) -> OTelSdkResult {
+            self.0.force_flush()
+        }
+        fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+            self.0.shutdown_with_timeout(timeout)
+        }
+        fn temporality(&self, kind: InstrumentKind) -> Temporality {
+            self.0.temporality(kind)
+        }
+    }
+
+    struct Harness {
+        reader: SharedReader,
+        // Kept alive for the process: the reader holds only a `Weak` to the
+        // provider's pipeline, so dropping the provider would make `collect`
+        // fail with "reader is shut down or not registered".
+        _provider: SdkMeterProvider,
+    }
+
+    static HARNESS: OnceLock<Harness> = OnceLock::new();
+
+    fn harness() -> &'static Harness {
+        HARNESS.get_or_init(|| {
+            let reader = SharedReader(Arc::new(ManualReader::builder().build()));
+            let provider = SdkMeterProvider::builder()
+                .with_reader(reader.clone())
+                .with_resource(
+                    Resource::builder()
+                        .with_service_name("streamling-test")
+                        .build(),
+                )
+                .build();
+            // Install as the process-global provider BEFORE any counters are
+            // built so instruments bind to this collectable provider.
+            global::set_meter_provider(provider.clone());
+            Harness {
+                reader,
+                _provider: provider,
+            }
+        })
+    }
+
+    /// Atomically (re)build the recorder singleton with a single source node's
+    /// metadata, bound to the collectable test meter provider. Force-replacing
+    /// the whole recorder — rather than merging into whatever exists — both
+    /// guarantees `node_wait` counters point at our reader and avoids ever
+    /// exposing a `None`/half-built singleton to a concurrent reader. Must be
+    /// called while holding [`TEST_LOCK`]; `reference_name` is used both as the
+    /// recorder metadata key and as the emitted `id` tag value.
+    pub(crate) fn init_recorder_with_node(reference_name: &str) {
+        init_recorder_with_nodes(&[reference_name]);
+    }
+
+    /// Like [`init_recorder_with_node`] but registers the node as a SQL
+    /// transform (`node_type=Transform`, `operator_type="sql"`). Only `"sql"`
+    /// nodes flow their DataFusion `ExecutionPlan` metrics into
+    /// `elapsed_compute` (see `record_execution_plan_metrics`), so this is the
+    /// harness for asserting the busy triad of a `WrappingExec ->
+    /// CheckpointableExec -> <SQL plan>` transform.
+    pub(crate) fn init_recorder_with_sql_transform(reference_name: &str) {
+        harness();
+        let mut map = HashMap::new();
+        map.insert(
+            reference_name.to_string(),
+            PipelineMetricMetadata {
+                node_context: NodeContext::new(TopologyNodeType::Transform, "sql", reference_name),
+                service_instance_id: "test-instance".to_string(),
+                additional_tags: Default::default(),
+                children_metadata_ids: vec![],
+            },
+        );
+        let recorder = build_metrics_recorder(map);
+        *METRICS_RECORDER_INSTANCE
+            .lock()
+            .expect("recorder instance mutex poisoned") = Some(Arc::new(recorder));
+    }
+
+    /// Like [`init_recorder_with_node`] but registers several nodes in a single
+    /// recorder build, so a test can drive multiple `WrappingExec`s without an
+    /// intervening singleton rebuild.
+    pub(crate) fn init_recorder_with_nodes(reference_names: &[&str]) {
+        harness();
+        let mut map = HashMap::new();
+        for reference_name in reference_names {
+            map.insert(
+                reference_name.to_string(),
+                PipelineMetricMetadata {
+                    node_context: NodeContext::new(
+                        TopologyNodeType::Source,
+                        "memory",
+                        reference_name,
+                    ),
+                    service_instance_id: "test-instance".to_string(),
+                    additional_tags: Default::default(),
+                    children_metadata_ids: vec![],
+                },
+            );
+        }
+        let recorder = build_metrics_recorder(map);
+        *METRICS_RECORDER_INSTANCE
+            .lock()
+            .expect("recorder instance mutex poisoned") = Some(Arc::new(recorder));
+    }
+
+    /// Sum every `streamling_node_wait` data point matching the given `id` and
+    /// `state`, optionally also pinning `downstream_id`. Values are cumulative,
+    /// so tests should use a unique node `id` to isolate from cross-test series.
+    pub(crate) fn node_wait_ms(id: &str, state: &str, downstream_id: Option<&str>) -> u64 {
+        // Closed spans are banked, not emitted, until a flush.
+        crate::telemetry::node_time::flush_live();
+        emitted_node_wait_ms(id, state, downstream_id)
+    }
+
+    /// Like [`node_wait_ms`], without flushing: only what the background
+    /// flusher or a `Drop` already emitted.
+    pub(crate) fn emitted_node_wait_ms(id: &str, state: &str, downstream_id: Option<&str>) -> u64 {
+        let mut rm = ResourceMetrics::default();
+        harness()
+            .reader
+            .collect(&mut rm)
+            .expect("collect metrics from manual reader");
+        let mut total = 0u64;
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "streamling_node_wait" {
+                    continue;
+                }
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    continue;
+                };
+                for dp in sum.data_points() {
+                    let mut id_ok = false;
+                    let mut state_ok = false;
+                    let mut ds_ok = downstream_id.is_none();
+                    for kv in dp.attributes() {
+                        let value = kv.value.as_str();
+                        match kv.key.as_str() {
+                            "id" => id_ok = &*value == id,
+                            "state" => state_ok = &*value == state,
+                            "downstream_id" => {
+                                if let Some(want) = downstream_id {
+                                    ds_ok = &*value == want;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if id_ok && state_ok && ds_ok {
+                        total += dp.value();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Sum every data point of the `streamling_<name>` counter for node `id`.
+    pub(crate) fn counter_total(name: &str, id: &str) -> u64 {
+        let mut rm = ResourceMetrics::default();
+        harness()
+            .reader
+            .collect(&mut rm)
+            .expect("collect metrics from manual reader");
+        let metric_name = format!("streamling_{name}");
+        let mut total = 0u64;
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != metric_name {
+                    continue;
+                }
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    continue;
+                };
+                for dp in sum.data_points() {
+                    if dp
+                        .attributes()
+                        .any(|kv| kv.key.as_str() == "id" && &*kv.value.as_str() == id)
+                    {
+                        total += dp.value();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// Sum the `streamling_elapsed_compute` histogram's recorded values (in ms)
+    /// for the given node `id`.
+    pub(crate) fn elapsed_compute_ms(id: &str) -> u64 {
+        elapsed_compute_histogram(id).0
+    }
+
+    /// Number of `streamling_elapsed_compute` observations for `id`. Dashboards
+    /// read the histogram per batch (`_count`, quantiles), so a node must record
+    /// at most one observation per batch.
+    pub(crate) fn elapsed_compute_samples(id: &str) -> u64 {
+        elapsed_compute_histogram(id).1
+    }
+
+    /// `(sum_ms, count)` of the `streamling_elapsed_compute` histogram for `id`.
+    fn elapsed_compute_histogram(id: &str) -> (u64, u64) {
+        let mut rm = ResourceMetrics::default();
+        harness()
+            .reader
+            .collect(&mut rm)
+            .expect("collect metrics from manual reader");
+        let (mut sum, mut count) = (0u64, 0u64);
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "streamling_elapsed_compute" {
+                    continue;
+                }
+                let AggregatedMetrics::U64(MetricData::Histogram(hist)) = metric.data() else {
+                    continue;
+                };
+                for dp in hist.data_points() {
+                    let id_ok = dp
+                        .attributes()
+                        .any(|kv| kv.key.as_str() == "id" && &*kv.value.as_str() == id);
+                    if id_ok {
+                        sum += dp.sum();
+                        count += dp.count();
+                    }
+                }
+            }
+        }
+        (sum, count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1552,14 +2027,36 @@ mod tests {
     use crate::node_context::{NodeContext, TopologyNodeType};
     use crate::telemetry::PipelineMetricMetadata;
 
+    /// A user label named like a `node_wait` tag stays on every other metric;
+    /// on `node_wait` the per-call tag replaces it.
+    #[test]
+    fn node_wait_tags_replace_a_same_named_user_label() {
+        use crate::telemetry::recorder::test_support::{
+            TEST_LOCK, init_recorder_with_node, node_wait_ms,
+        };
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "recorder::state_label";
+        init_recorder_with_node(id);
+        merge_metadata_tags(id, vec![("state".into(), "prod".into())]);
+
+        get_metrics_recorder().record_count_w_tags(
+            "node_wait",
+            7,
+            vec![("state", "busy"), ("downstream_id", "")],
+            id,
+        );
+        assert_eq!(node_wait_ms(id, "busy", None), 7);
+        assert_eq!(node_wait_ms(id, "prod", None), 0);
+    }
+
     /// Tests for `merge_metadata_tags`. These tests touch the global
     /// `METRICS_RECORDER_INSTANCE`; a mutex serializes them so state from one test cannot
     /// bleed into another under parallel execution.
     mod merge_metadata_tags_tests {
         use super::*;
-        use std::sync::Mutex;
-
-        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        // Shared with the `WrappingExec`/`BroadcastStream` runtime metric tests
+        // so every test mutating the global recorder singleton is serialized.
+        use crate::telemetry::recorder::test_support::TEST_LOCK;
 
         fn reset_instance() {
             let mut instance = METRICS_RECORDER_INSTANCE.lock().unwrap();
@@ -1915,6 +2412,32 @@ mod tests {
             let tags = additional_tags("app::blocks");
             assert_eq!(tags.get("chain"), Some(&"polygon".to_string()));
             assert_eq!(tags.get("tier"), Some(&"gold".to_string()));
+        }
+
+        /// The node_wait counter must be pre-registered. Emission paths look
+        /// counters up by name and panic if missing (see `record_metric_data`),
+        /// so this guards against a refactor silently dropping the
+        /// registration. Built directly, not through the singleton: an unlocked
+        /// test's `get_metrics_recorder` can install the empty fallback
+        /// recorder between a reset and the seed.
+        #[test]
+        fn node_wait_counter_is_registered() {
+            let mut map = HashMap::new();
+            map.insert(
+                "app::blocks".to_string(),
+                PipelineMetricMetadata {
+                    node_context: NodeContext::new(TopologyNodeType::Source, "plugin", "blocks"),
+                    service_instance_id: "test-instance".to_string(),
+                    additional_tags: Default::default(),
+                    children_metadata_ids: vec![],
+                },
+            );
+            let recorder = build_metrics_recorder(map);
+            let counters = recorder.count_registry.lock().unwrap();
+            assert!(
+                counters.contains_key("node_wait"),
+                "node_wait counter must be pre-registered"
+            );
         }
 
         /// `ELAPSED_COMPUTE_SEED_MS` is the consumer-facing contract: values at
@@ -2560,6 +3083,232 @@ mod tests {
 
             drop(first);
             assert_eq!(exported_partitions(&provider, &exporter), ["2"]);
+        }
+    }
+
+    mod pipeline_io_delta_tests {
+        use super::*;
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use opentelemetry::metrics::MeterProvider;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData as OtelMetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, InMemoryMetricExporterBuilder, PeriodicReader,
+            SdkMeterProvider, Temporality,
+        };
+        use std::collections::BTreeMap;
+
+        const NAMES: [&str; 6] = [
+            "output_rows",
+            "output_rows_delta",
+            "input_rows",
+            "input_rows_delta",
+            "input_bytes_delta",
+            "output_bytes_delta",
+        ];
+
+        /// `rows` Int64 values: 8 bytes each, no nulls.
+        fn int_batch(rows: usize) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))],
+            )
+            .unwrap()
+        }
+
+        fn recorder_with_nodes(
+            nodes: &[(&str, TopologyNodeType, &str, &[&str])],
+        ) -> (MetricsRecorder, SdkMeterProvider, InMemoryMetricExporter) {
+            let exporter = InMemoryMetricExporterBuilder::new()
+                .with_temporality(Temporality::Delta)
+                .build();
+            let reader = PeriodicReader::builder(exporter.clone())
+                .with_interval(Duration::from_secs(3600))
+                .build();
+            let provider = SdkMeterProvider::builder().with_reader(reader).build();
+            let meter = provider.meter("test");
+            let recorder = MetricsRecorder::default();
+            {
+                let mut counts = recorder.count_registry.lock().unwrap();
+                for name in NAMES {
+                    counts.insert(name.to_string(), meter.u64_counter(name).build());
+                }
+            }
+            for (id, node_type, operator_type, children) in nodes {
+                let metadata = PipelineMetricMetadata {
+                    node_context: NodeContext::new(node_type.clone(), operator_type, id),
+                    service_instance_id: "app".to_string(),
+                    additional_tags: BTreeMap::new(),
+                    children_metadata_ids: children.iter().map(|c| c.to_string()).collect(),
+                };
+                recorder
+                    .metric_metadata_tags_registry
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), metadata.to_tags());
+                recorder
+                    .metric_metadata_registry
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), metadata);
+            }
+            (recorder, provider, exporter)
+        }
+
+        /// Sum of every exported point of `name` whose `id` tag equals `id`.
+        fn exported_sum(
+            provider: &SdkMeterProvider,
+            exporter: &InMemoryMetricExporter,
+            name: &str,
+            id: &str,
+        ) -> u64 {
+            provider.force_flush().expect("flush");
+            let mut total = 0;
+            for resource in exporter.get_finished_metrics().expect("metrics") {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics().filter(|m| m.name() == name) {
+                        if let AggregatedMetrics::U64(OtelMetricData::Sum(sum)) = metric.data() {
+                            total += sum
+                                .data_points()
+                                .filter(|p| {
+                                    p.attributes().any(|kv| {
+                                        kv.key.as_str() == "id" && kv.value.to_string() == id
+                                    })
+                                })
+                                .map(|p| p.value())
+                                .sum::<u64>();
+                        }
+                    }
+                }
+            }
+            total
+        }
+
+        /// A source's input wrapper counts the rows it pulls in as input only: source bytes are
+        /// wire bytes, which each connector records, and its output is counted above the filter.
+        #[test]
+        fn source_input_counts_rows_but_not_bytes_or_output() {
+            let (recorder, provider, exporter) =
+                recorder_with_nodes(&[("src", TopologyNodeType::Source, "kafka", &[])]);
+            for rows in [10, 5] {
+                recorder.record_execution_plan_metrics(
+                    "src",
+                    &int_batch(rows),
+                    RowCountMeasurementType::SourceInputRowCount,
+                    None,
+                );
+            }
+            for (name, rows) in [
+                ("input_rows", 15),
+                ("input_rows_delta", 15),
+                ("input_bytes_delta", 0),
+                ("output_rows_delta", 0),
+            ] {
+                assert_eq!(
+                    exported_sum(&provider, &exporter, name, "src"),
+                    rows,
+                    "{name}"
+                );
+            }
+        }
+
+        /// A source that drops rows before its wrapper sees them (ClickHouse version dedup)
+        /// counts its own input pair.
+        #[test]
+        fn self_counted_source_input_emits_both_series() {
+            let (recorder, provider, exporter) =
+                recorder_with_nodes(&[("src", TopologyNodeType::Source, "clickhouse", &[])]);
+            recorder.record_input_rows_count(6, "src");
+            recorder.record_input_rows_count(3, "src");
+            recorder.record_input_rows_count(9, "unregistered");
+            for name in ["input_rows", "input_rows_delta"] {
+                assert_eq!(exported_sum(&provider, &exporter, name, "src"), 9, "{name}");
+            }
+        }
+
+        /// A source that pulls in 10 rows and keeps 4 after its filter: the source's input is
+        /// 10, its output is 4, and the transform below it receives (and counts) 4.
+        #[test]
+        fn filtered_source_output_is_its_childs_input() {
+            let (recorder, provider, exporter) = recorder_with_nodes(&[
+                ("src", TopologyNodeType::Source, "kafka", &["xform"]),
+                ("xform", TopologyNodeType::Transform, "sql", &[]),
+            ]);
+            recorder.record_execution_plan_metrics(
+                "src",
+                &int_batch(10),
+                RowCountMeasurementType::SourceInputRowCount,
+                None,
+            );
+            recorder.record_execution_plan_metrics(
+                "src",
+                &int_batch(4),
+                RowCountMeasurementType::OutputRowCount,
+                None,
+            );
+            for (name, id, rows) in [
+                ("input_rows_delta", "src", 10),
+                ("output_rows_delta", "src", 4),
+                ("input_rows_delta", "xform", 4),
+            ] {
+                assert_eq!(
+                    exported_sum(&provider, &exporter, name, id),
+                    rows,
+                    "{name} of {id}"
+                );
+            }
+        }
+
+        /// `input_rows_delta` is the delta twin of `input_rows` on every node kind that counts
+        /// input rows: a source (its own pre-filter rows), a transform (its parent's output
+        /// rows) and a sink (the rows it receives).
+        #[test]
+        fn input_rows_delta_matches_input_rows_on_every_node() {
+            let (recorder, provider, exporter) = recorder_with_nodes(&[
+                ("src", TopologyNodeType::Source, "kafka", &["xform", "snk"]),
+                ("xform", TopologyNodeType::Transform, "sql", &[]),
+                ("snk", TopologyNodeType::Sink, "postgres", &[]),
+            ]);
+            for measurement in [
+                RowCountMeasurementType::SourceInputRowCount,
+                RowCountMeasurementType::OutputRowCount,
+            ] {
+                recorder.record_execution_plan_metrics("src", &int_batch(6), measurement, None);
+            }
+            recorder.record_execution_plan_metrics(
+                "snk",
+                &int_batch(4),
+                RowCountMeasurementType::InputRowCount,
+                None,
+            );
+            for (id, rows) in [("src", 6), ("xform", 6), ("snk", 4)] {
+                for name in ["input_rows", "input_rows_delta"] {
+                    assert_eq!(
+                        exported_sum(&provider, &exporter, name, id),
+                        rows,
+                        "{name} of {id}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn sink_write_counts_delivered_rows_and_bytes() {
+            let (recorder, provider, exporter) =
+                recorder_with_nodes(&[("snk", TopologyNodeType::Sink, "postgres", &[])]);
+            recorder.record_sink_write(&int_batch(3), 3, "snk");
+            // 2 of 4 rows delivered: half the batch's bytes.
+            recorder.record_sink_write(&int_batch(4), 2, "snk");
+            recorder.record_sink_delivery(0, 4, Ok(32), "snk");
+            recorder.record_sink_write(&int_batch(4), 4, "unregistered");
+            for name in ["output_rows", "output_rows_delta"] {
+                assert_eq!(exported_sum(&provider, &exporter, name, "snk"), 5, "{name}");
+            }
+            assert_eq!(
+                exported_sum(&provider, &exporter, "output_bytes_delta", "snk"),
+                5 * 8
+            );
         }
     }
 }

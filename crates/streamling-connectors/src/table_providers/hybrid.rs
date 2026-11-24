@@ -30,6 +30,7 @@ use streamling_core::side_output::{SourceSideOutput, SupportsSideOutputs};
 use streamling_core::telemetry::provider::{
     metric_key, metric_key_hybrid_src_bounded, metric_key_hybrid_src_unbounded,
 };
+use streamling_core::telemetry::task_wait::{ReservedMeter, TaskWaitMeter};
 use streamling_core::topology::{
     HybridBoundedSource, HybridOffsetTable, HybridUnboundedSource, Telemetry,
 };
@@ -280,6 +281,8 @@ impl HybridTableProvider {
         let mut bounded_table_providers = Vec::new();
 
         let application_id = app_config.application_id.clone();
+        // Both phases count the rows they pull in as the hybrid node's input.
+        let input_rows_id = Some(metric_key(&application_id, &reference_name));
 
         let unbounded_source_topic = unbounded_source.topic.clone();
         let unbounded_table_provider: Arc<dyn TableProvider> =
@@ -324,12 +327,15 @@ impl HybridTableProvider {
                         })?
                         .with_scope(scope.clone()),
                     );
-                    Arc::new(WrappingSourceTableProvider::new(
-                        kafka_table_provider,
-                        metric_key_hybrid_src_unbounded(&application_id, reference_name.as_str()),
-                        None,
-                        telemetry,
-                    ))
+                    Arc::new(
+                        WrappingSourceTableProvider::new(
+                            kafka_table_provider,
+                            metric_key_hybrid_src_unbounded(&application_id, &reference_name),
+                            None,
+                            telemetry,
+                        )
+                        .with_input_rows_id(input_rows_id.clone()),
+                    )
                 }
                 _ => {
                     return Err(streamling_core::streamling_user_err!(
@@ -396,16 +402,20 @@ impl HybridTableProvider {
                         clickhouse_provider.schema()
                     );
 
-                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
-                        clickhouse_provider,
-                        metric_key_hybrid_src_bounded(
-                            &application_id,
-                            reference_name.as_str(),
-                            idx,
-                        ),
-                        None, // We shouldn't need it here since the whole thing is nested under one wrapping provider.
-                        telemetry,
-                    ));
+                    let provider_with_telemetry = Arc::new(
+                        WrappingSourceTableProvider::new(
+                            clickhouse_provider,
+                            metric_key_hybrid_src_bounded(
+                                &application_id,
+                                reference_name.as_str(),
+                                idx,
+                            ),
+                            None, // We shouldn't need it here since the whole thing is nested under one wrapping provider.
+                            telemetry,
+                        )
+                        // The ClickHouse exec counts its input rows on the hybrid node itself.
+                        .with_input_rows_id(None),
+                    );
                     bounded_table_providers.push(provider_with_telemetry as Arc<dyn TableProvider>);
                 }
                 _ => {
@@ -580,6 +590,8 @@ impl HybridTableProvider {
         }
 
         match (bounded_type, unbounded_type) {
+            (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+            | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => true,
             // Nested field names can differ (for example "item" vs "element"):
             // Arrow/DataFusion producers label list children differently even
             // when the list semantics are identical.
@@ -1223,6 +1235,10 @@ impl ExecutionPlan for HybridSourceExec {
         let schema = self.schema();
         let builder = RecordBatchReceiverStreamBuilder::new(schema.clone(), 16);
         let tx = builder.tx();
+        // Each phase source claims the node's meter when it executes; reserve
+        // it now so the wrapper never times the phases' channel as `starved`.
+        // This driver's own work (normalize) and edge sends are the node's too.
+        let reserved_meter = TaskWaitMeter::reserve(&context);
         let provider = self.provider.clone();
         let context_clone = context.clone();
         let projection = self.projection.clone();
@@ -1372,13 +1388,13 @@ impl ExecutionPlan for HybridSourceExec {
                 let current_source_schema = match current_source_result {
                     Ok(source) => source.schema(),
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let _ = reserved_meter.send(tx.send(Err(e))).await;
                         break 'outer;
                     }
                 };
 
                 if let Err(e) = provider.snapshot_unbounded_offsets().await {
-                    let _ = tx.send(Err(e)).await;
+                    let _ = reserved_meter.send(tx.send(Err(e))).await;
                     break 'outer;
                 }
 
@@ -1395,7 +1411,7 @@ impl ExecutionPlan for HybridSourceExec {
                 let mut stream = match stream_result {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let _ = reserved_meter.send(tx.send(Err(e))).await;
                         break 'outer;
                     }
                 };
@@ -1414,7 +1430,7 @@ impl ExecutionPlan for HybridSourceExec {
                         Ok(batch) => {
                             let schema_clone = schema_for_main.clone();
                             let source_schema_clone = current_source_schema.clone();
-                            let normalized = match run_blocking(move || {
+                            let normalized = match reserved_meter.work(run_blocking(move || {
                                 // Inner phases do not reliably honor the pushed-down
                                 // projection (the bounded ClickHouse scan ignores it
                                 // and emits every column, in ClickHouse order), so
@@ -1434,22 +1450,22 @@ impl ExecutionPlan for HybridSourceExec {
                                     &batch,
                                     &schema_clone,
                                 )
-                            })
+                            }))
                             .await
                             {
                                 Ok(b) => b,
                                 Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
+                                    let _ = reserved_meter.send(tx.send(Err(e))).await;
                                     break 'outer;
                                 }
                             };
                             let merged = merge_pending_markers(normalized, &pending_for_main);
-                            if tx.send(Ok(merged)).await.is_err() {
+                            if reserved_meter.send(tx.send(Ok(merged))).await.is_err() {
                                 break 'outer;
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(e)).await;
+                            let _ = reserved_meter.send(tx.send(Err(e))).await;
                             break 'outer;
                         }
                     }
@@ -1466,6 +1482,7 @@ impl ExecutionPlan for HybridSourceExec {
                     &pending_for_main,
                     &schema_for_synth,
                     &tx,
+                    &reserved_meter,
                     &reference_name_for_spawn,
                 )
                 .await;
@@ -1495,6 +1512,7 @@ impl ExecutionPlan for HybridSourceExec {
                             &pending_for_main,
                             &schema_for_synth,
                             &tx,
+                            &reserved_meter,
                             &reference_name_for_spawn,
                         )
                         .await;
@@ -1518,6 +1536,7 @@ impl ExecutionPlan for HybridSourceExec {
                             &pending_for_main,
                             &schema_for_synth,
                             &tx,
+                            &reserved_meter,
                             &reference_name_for_spawn,
                         )
                         .await;
@@ -1547,6 +1566,7 @@ impl ExecutionPlan for HybridSourceExec {
                                     &pending_for_main,
                                     &schema_for_synth,
                                     &tx,
+                                    &reserved_meter,
                                     &reference_name_for_spawn,
                                 )
                                 .await;
@@ -1565,7 +1585,7 @@ impl ExecutionPlan for HybridSourceExec {
                              The next restart will probe per-phase state for recovery: {:?}",
                             provider.reference_name, e
                         );
-                        let _ = tx.send(Err(e)).await;
+                        let _ = reserved_meter.send(tx.send(Err(e))).await;
                         break 'outer;
                     }
                 }
@@ -1581,6 +1601,7 @@ impl ExecutionPlan for HybridSourceExec {
                 &pending_for_main,
                 &schema_for_synth,
                 &tx,
+                &reserved_meter,
                 &reference_name_for_spawn,
             )
             .await;
@@ -1727,6 +1748,7 @@ async fn emit_terminal_checkpoint(
     pending: &Arc<Mutex<Vec<CheckpointMessage>>>,
     schema_for_synth: &SchemaRef,
     tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
+    meter: &ReservedMeter,
     reference_name: &str,
 ) {
     let terminal = control.begin_terminal_checkpoint();
@@ -1738,10 +1760,11 @@ async fn emit_terminal_checkpoint(
             epoch: terminal.clone(),
             created_at_ms: now_ms(),
         });
-    flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
+    flush_pending_to_synth_batch(pending, schema_for_synth, tx, meter, reference_name).await;
 
     // The send above is buffered and the sinks pull concurrently, so awaiting
-    // here does not block their consumption of the marker batch.
+    // here does not block their consumption of the marker batch. The wait is
+    // in no state: the driver times only inside `ReservedMeter::work`/`send`.
     if !control.await_terminal_finalized_on_completion().await {
         let finalize_timeout = terminal_checkpoint_finalize_timeout();
         // At least one live sink never confirmed its writes. Do NOT emit the
@@ -1774,7 +1797,7 @@ async fn emit_terminal_checkpoint(
         .lock()
         .expect("pending markers mutex poisoned")
         .push(CheckpointMessage::Finalizer(terminal));
-    flush_pending_to_synth_batch(pending, schema_for_synth, tx, reference_name).await;
+    flush_pending_to_synth_batch(pending, schema_for_synth, tx, meter, reference_name).await;
 }
 
 /// Flush any markers currently buffered in `pending` to the downstream
@@ -1794,6 +1817,7 @@ async fn flush_pending_to_synth_batch(
     pending: &Arc<Mutex<Vec<CheckpointMessage>>>,
     schema_for_synth: &SchemaRef,
     tx: &tokio::sync::mpsc::Sender<DataFusionResult<RecordBatch>>,
+    meter: &ReservedMeter,
     reference_name: &str,
 ) {
     let drained: Vec<CheckpointMessage> = {
@@ -1833,7 +1857,7 @@ async fn flush_pending_to_synth_batch(
         md,
     ));
     let synth = RecordBatch::new_empty(synth_schema);
-    if tx.send(Ok(synth)).await.is_err() {
+    if meter.send(tx.send(Ok(synth))).await.is_err() {
         // Downstream already gone. On teardown paths this is expected; on the
         // terminal-checkpoint path it means the Marker/Finalizer batch was
         // dropped and the epoch will not finalize (at-least-once replay covers
@@ -2169,7 +2193,14 @@ mod tests {
         let schema = create_test_schema();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
 
-        flush_pending_to_synth_batch(&pending, &schema, &tx, "dedup_test").await;
+        flush_pending_to_synth_batch(
+            &pending,
+            &schema,
+            &tx,
+            &ReservedMeter::default(),
+            "dedup_test",
+        )
+        .await;
 
         let batch = rx
             .recv()
@@ -2191,6 +2222,50 @@ mod tests {
             "duplicate Finalizers for one epoch must collapse"
         );
         assert!(pending.lock().unwrap().is_empty(), "pending fully drained");
+    }
+
+    /// A synthetic checkpoint batch is a send along the edge: time waiting on a
+    /// full channel is the node's `blocked`, like any other output send.
+    #[tokio::test]
+    async fn test_flush_pending_send_wait_is_blocked() {
+        use datafusion::prelude::SessionContext;
+        use streamling_core::checkpoints::checkpoint_management::CheckpointEpoch;
+        use streamling_core::telemetry::node_time::NodeTime;
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let recorder = get_metrics_recorder();
+        let blocked = NodeTime::wall(Arc::clone(&recorder), "hybrid::test", "blocked", "down");
+        let (child, _meter) = TaskWaitMeter::install(
+            &SessionContext::new().task_ctx(),
+            recorder,
+            "hybrid::test",
+            Some(Arc::clone(&blocked)),
+        );
+        let meter = TaskWaitMeter::reserve(&child);
+
+        let pending = Arc::new(Mutex::new(vec![CheckpointMessage::Finalizer(
+            CheckpointEpoch(1),
+        )]));
+        let schema = create_test_schema();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Ok(RecordBatch::new_empty(Arc::clone(&schema))))
+            .await
+            .expect("receiver alive");
+
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            rx.recv().await
+        };
+        let ((), _) = tokio::join!(
+            flush_pending_to_synth_batch(&pending, &schema, &tx, &meter, "blocked_test"),
+            drain
+        );
+
+        assert!(
+            blocked.total() >= Duration::from_millis(50),
+            "{:?}",
+            blocked.total()
+        );
     }
 
     async fn create_state_backend(name: &str) -> Arc<dyn StateOperatorBackend<HybridSourceState>> {
@@ -2400,6 +2475,152 @@ mod tests {
             &list(true),
             &list(false)
         ));
+    }
+
+    #[test]
+    fn string_and_binary_bounded_types_back_view_unbounded_types() {
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeUtf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Binary,
+            &DataType::BinaryView
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeBinary,
+            &DataType::BinaryView
+        ));
+        // Nested view target under a list is also compatible.
+        let bounded_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let unbounded_list =
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true)));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &bounded_list,
+            &unbounded_list
+        ));
+        // Reverse direction is not implicitly widened.
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8View,
+            &DataType::Utf8
+        ));
+    }
+
+    #[test]
+    fn hybrid_bounded_batch_normalizes_string_and_binary_to_view() {
+        use arrow::array::{
+            Array, AsArray, BinaryArray, FixedSizeListArray, Int64Array, LargeStringArray,
+            ListBuilder, StringArray, StringBuilder,
+        };
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder
+            .values()
+            .append_value("long_nested_topic_value");
+        list_builder.append(true);
+        list_builder.append_null();
+
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            Arc::new(StringArray::from(vec![
+                Some("fixed_slot_0_long"),
+                Some("fixed_slot_1_long"),
+                None,
+                None,
+            ])),
+            None,
+        )
+        .unwrap();
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("raw", DataType::Binary, true),
+            Field::new("input", DataType::LargeUtf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 2),
+                true,
+            ),
+            Field::new("extra", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"0123456789abcdef".as_slice()),
+                    None,
+                ])),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("0x1234567890abcdef1234567890abcdef"),
+                    None,
+                ])),
+                Arc::new(list_builder.finish()),
+                Arc::new(fsl),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("element", DataType::Utf8View, true)),
+                    2,
+                ),
+                true,
+            ),
+        ]));
+
+        // Exercises the exact two-step path HybridSourceExec runs on every batch.
+        let aligned = align_batch_to_schema(&batch, &target_schema, &batch.schema()).unwrap();
+        let normalized =
+            ClickHouseClient::normalize_batch_from_clickhouse(&aligned, &target_schema).unwrap();
+
+        assert_eq!(normalized.schema(), target_schema);
+        assert_eq!(
+            normalized.column(0).as_string_view().value(0),
+            "0x1234567890abcdef1234567890abcdef"
+        );
+        assert!(normalized.column(0).is_null(1));
+        assert_eq!(
+            normalized.column(1).as_binary_view().value(0),
+            b"0123456789abcdef"
+        );
+        assert!(normalized.column(1).is_null(1));
+
+        let aligned_list = normalized.column(2).as_list::<i32>();
+        assert_eq!(
+            aligned_list.values().as_string_view().value(0),
+            "long_nested_topic_value"
+        );
+        assert!(aligned_list.is_null(1));
+
+        let aligned_pair = normalized.column(3).as_fixed_size_list();
+        assert_eq!(
+            aligned_pair.values().as_string_view().value(0),
+            "fixed_slot_0_long"
+        );
+        assert_eq!(
+            aligned_pair.values().as_string_view().value(1),
+            "fixed_slot_1_long"
+        );
     }
 
     #[test]
@@ -3508,6 +3729,179 @@ mod tests {
         assert!(
             state.completed_phases.iter().all(|&c| c),
             "All bounded phases should be marked complete"
+        );
+    }
+
+    /// The wrapper decides once, at `execute`, whether it or the operator
+    /// measures `starved`. Phases claim the meter later, inside the spawned
+    /// task, so the hybrid source must reserve it up front.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hybrid_source_reserves_the_node_meter_at_execute() {
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(FiniteMockTableProvider::new())],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend =
+            create_state_backend("test_hybrid_source_reserves_the_node_meter_at_execute").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "test_reserves_meter".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+        let plan = hybrid_provider
+            .scan(&SESSION_MANAGER.session_state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "test_reserves_meter",
+            None,
+        );
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        assert!(meter.is_claimed(), "reserved before any phase runs");
+        let _: Vec<_> = stream.collect().await;
+    }
+
+    /// A phase source that claims its node meter and works for 40ms.
+    #[derive(Debug)]
+    struct ClaimingMockProvider;
+
+    #[async_trait]
+    impl TableProvider for ClaimingMockProvider {
+        fn schema(&self) -> SchemaRef {
+            create_test_schema()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let schema = create_test_schema();
+            Ok(Arc::new(ClaimingMockExec {
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema.clone()),
+                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Final,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+                schema,
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClaimingMockExec {
+        schema: SchemaRef,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for ClaimingMockExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "ClaimingMockExec")
+        }
+    }
+
+    impl ExecutionPlan for ClaimingMockExec {
+        fn name(&self) -> &str {
+            "ClaimingMockExec"
+        }
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            let task_wait = TaskWaitMeter::claim(&context);
+            let work = futures::stream::once(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                drop(task_wait);
+            })
+            .filter_map(|()| futures::future::ready(None));
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    work,
+                ),
+            ))
+        }
+    }
+
+    /// Phases run behind their own `WrappingExec`, which must not shadow the
+    /// meter the hybrid reserved: the phase work is the hybrid node's `busy`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hybrid_phase_work_reaches_the_hybrid_node_meter() {
+        use streamling_core::operators::wrapping::WrappingSourceTableProvider;
+        use streamling_core::telemetry::recorder::get_metrics_recorder;
+
+        let phase = |name: &str| -> Arc<dyn TableProvider> {
+            Arc::new(WrappingSourceTableProvider::new(
+                Arc::new(ClaimingMockProvider),
+                name.to_string(),
+                None,
+                None,
+            ))
+        };
+        let config = HybridSourceConfig {
+            bounded_sources: vec![phase("phase_meter_bounded_0")],
+            unbounded_source: phase("phase_meter_unbounded"),
+            offset_provider: None,
+            job_mode: true,
+        };
+        let state_backend =
+            create_state_backend("test_hybrid_phase_work_reaches_the_hybrid_node_meter").await;
+        let hybrid_provider = HybridTableProvider::new(
+            "phase_meter".to_string(),
+            config,
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+        let plan = hybrid_provider
+            .scan(&SESSION_MANAGER.session_state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let (context, meter) = TaskWaitMeter::install(
+            &TaskContext::default(),
+            get_metrics_recorder(),
+            "phase_meter",
+            None,
+        );
+        let stream = plan.execute(0, context).expect("execute should succeed");
+        let _: Vec<_> = stream.collect().await;
+        let busy = meter.totals().busy;
+        assert!(
+            busy >= Duration::from_millis(40),
+            "the bounded phase's 40ms of work must be the hybrid node's busy, got {busy:?}"
         );
     }
 

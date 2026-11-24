@@ -17,12 +17,14 @@ use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
+use streamling_core::telemetry::recorder::get_metrics_recorder;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info};
 
 use streamling_core::checkpoints::checkpoint_management::CheckpointEpoch;
+use streamling_core::telemetry::task_wait::TaskWaitHandle;
 
 use super::checkpoint::CheckpointInbox;
 use super::{ScanProjection, build_output_batch};
@@ -66,6 +68,7 @@ pub(super) enum ReadEnd {
 /// What one partition's read loop needs besides its plan.
 pub(super) struct PartitionReader {
     pub(super) reference_name: String,
+    pub(super) metric_metadata_id: String,
     pub(super) object_store_url: ObjectStoreUrl,
     pub(super) file_source: Arc<dyn FileSource>,
     pub(super) projection: ScanProjection,
@@ -75,6 +78,9 @@ pub(super) struct PartitionReader {
     pub(super) records_emitted: Arc<AtomicU64>,
     pub(super) shutdown_rx: watch::Receiver<bool>,
     pub(super) context: Arc<TaskContext>,
+    /// Reading files is the source's own work (`busy`); only the idle wait
+    /// for new files is `starved`.
+    pub(super) task_wait: TaskWaitHandle,
 }
 
 impl PartitionReader {
@@ -143,23 +149,32 @@ pub(super) async fn read_rounds<P: ReadPlan>(
                 // drained checkpoint messages — so downstream operators keep
                 // advancing.
                 let heartbeat = inbox.attach(RecordBatch::new_empty(reader.output_schema.clone()));
-                if tx.send(Ok(heartbeat)).await.is_err() {
+                if reader.task_wait.send(tx.send(Ok(heartbeat))).await.is_err() {
                     return Ok(ReadEnd::Disconnected);
                 }
-                tokio::select! {
-                    changed = reader.shutdown_rx.changed() => {
-                        if changed.is_err() || *reader.shutdown_rx.borrow() {
-                            return Ok(ReadEnd::Stopped);
+                let idle_end = reader
+                    .task_wait
+                    .wait_input(async {
+                        tokio::select! {
+                            changed = reader.shutdown_rx.changed() => {
+                                if changed.is_err() || *reader.shutdown_rx.borrow() {
+                                    return Some(ReadEnd::Stopped);
+                                }
+                                None
+                            }
+                            _ = sleep_until(until) => None,
+                            // Process shutdown (SIGTERM/SIGINT via the top-level handler,
+                            // or a record-limit sink): end the stream so downstream sinks
+                            // complete.
+                            _ = global_shutdown_rx.wait_for(|stopping| *stopping) => {
+                                info!("[{}] file source observed process shutdown; ending stream", reader.reference_name);
+                                Some(ReadEnd::Stopped)
+                            }
                         }
-                    }
-                    _ = sleep_until(until) => {}
-                    // Process shutdown (SIGTERM/SIGINT via the top-level handler,
-                    // or a record-limit sink): end the stream so downstream sinks
-                    // complete.
-                    _ = global_shutdown_rx.wait_for(|stopping| *stopping) => {
-                        info!("[{}] file source observed process shutdown; ending stream", reader.reference_name);
-                        return Ok(ReadEnd::Stopped);
-                    }
+                    })
+                    .await;
+                if let Some(end) = idle_end {
+                    return Ok(end);
                 }
                 continue;
             }
@@ -169,6 +184,14 @@ pub(super) async fn read_rounds<P: ReadPlan>(
             .limit
             .map(|limit| limit.saturating_sub(partition_emitted));
         let mut stream = reader.open_round(round.clone(), round_limit)?;
+        // Wire bytes: each file's full size when the round opens it. Like its rows,
+        // a round re-read after a stop or restart counts again.
+        let round_bytes: u64 = round.iter().map(|file| file.object_meta.size).sum();
+        get_metrics_recorder().record_count(
+            "input_bytes_delta",
+            round_bytes,
+            &reader.metric_metadata_id,
+        );
         while let Some(batch) = stream.next().await {
             let source_complete = inbox.drain(plan).await?;
             let batch = inbox.attach(build_output_batch(
@@ -177,7 +200,7 @@ pub(super) async fn read_rounds<P: ReadPlan>(
                 &reader.output_schema,
             )?);
             let rows = batch.num_rows();
-            if tx.send(Ok(batch)).await.is_err() {
+            if reader.task_wait.send(tx.send(Ok(batch))).await.is_err() {
                 return Ok(ReadEnd::Disconnected);
             }
             partition_emitted += rows;

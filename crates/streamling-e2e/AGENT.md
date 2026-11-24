@@ -116,6 +116,7 @@ Set automatically by `just e2e-test`:
 | `E2E_SCHEMA_REGISTRY_URL` | Schema registry URL                 |
 | `E2E_CLICKHOUSE_URL`      | ClickHouse HTTP URL                 |
 | `E2E_STREAMLING_BIN`      | Path to pre-built streamling binary |
+| `E2E_PROMETHEUS_URL`      | Prometheus URL; metrics and node-wait tests fail without it |
 
 ## Test Scenarios (postgres_sink.rs)
 

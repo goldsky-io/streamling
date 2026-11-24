@@ -26,7 +26,9 @@ impl ClickHouseQueryBuilder {
     // Helper function to format ScalarValue for SQL with proper quoting
     fn format_scalar_for_sql(value: &ScalarValue) -> String {
         match value {
-            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+            ScalarValue::Utf8(Some(s))
+            | ScalarValue::LargeUtf8(Some(s))
+            | ScalarValue::Utf8View(Some(s)) => {
                 format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
             }
             _ => value.to_string(), // For numbers, dates, etc., use default string representation
@@ -666,5 +668,15 @@ mod tests {
             query
         );
         assert!(query.contains("block_number >= 500"));
+    }
+
+    #[test]
+    fn test_format_scalar_utf8_view_is_quoted() {
+        assert_eq!(
+            ClickHouseQueryBuilder::format_scalar_for_sql(&ScalarValue::Utf8View(Some(
+                "0xabc'def\\g".to_string()
+            ))),
+            "'0xabc\\'def\\\\g'"
+        );
     }
 }

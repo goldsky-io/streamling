@@ -137,7 +137,7 @@ sinks:
 Every source, transform, and sink accepts an optional `telemetry` block:
 
 - **`event_time`** — column that carries the record's event time; drives `streamling_event_time_watermark_milliseconds` and `streamling_event_time_lag_milliseconds` series. `unit` required for integer columns (`seconds`, `milliseconds`, `microseconds`).
-- **`labels`** — map of `key: value` identity labels attached to every metric this node emits. Use for dataset identity, tier/team tagging, destination tagging.
+- **`labels`** — map of `key: value` identity labels attached to every metric this node emits; on `node_wait`, a label named `state` or `downstream_id` is replaced by the metric's own tag. Use for dataset identity, tier/team tagging, destination tagging.
 
 Label constraints (enforced at config load):
 
@@ -153,6 +153,51 @@ Label constraints (enforced at config load):
 **Precedence when labels collide with plugin-declared labels:** plugin wins, and a WARN log names the colliding key and both values. Plugins are authoritative about their own identity (`chain_slug`, `topic`, etc.); YAML cannot override them, but the WARN surfaces misconfigurations rather than letting them go silent.
 
 **Hybrid sources:** `telemetry.labels` on a hybrid source automatically propagate to both the bounded and unbounded phase-child metric series — declare them once on the parent.
+
+### Node-wait metric (starved / busy / blocked)
+
+A node's time is exported as one counter, `streamling_node_wait_milliseconds_total`, split by a **`state`** tag into the three states of the utilization triad. Together they localize a bottleneck at a glance:
+
+> **Measurement model:** `blocked` is measured at async polling/channel
+> boundaries, not as downstream service latency. Prefetch, bounded queues, and
+> concurrency can move observed wait between `blocked`, `starved`, and adjacent
+> edges. Read [`docs/node-wait-measurement-model.md`](docs/node-wait-measurement-model.md)
+> before changing buffering, connector scheduling, or plugin channels.
+
+| State | Series | Meaning |
+|-------|--------|---------|
+| **starved** | `node_wait{state="starved"}` | waiting for input: upstream, or new data from a source's external system |
+| **busy** | `node_wait{state="busy"}` | this node's own work: the CPU/service bottleneck |
+| **blocked** | `node_wait{state="blocked", downstream_id=...}` | held back by a specific downstream consumer |
+
+Who measures each state:
+
+| Node | starved | busy |
+|------|---------|------|
+| SQL transform | `WrappingExec` input poll minus the subtree's own DataFusion compute, which runs in the `CheckpointableExec` forwarder task | that compute (`OwnWork`) |
+| Handler / WASM / plugin transform | `TaskWaitMeter`: the task's input await | `TaskWaitMeter`: task time outside input and send awaits |
+| Kafka / ClickHouse / file / hybrid source | `TaskWaitMeter`: broker wait, failure backoff, idle file poll | `TaskWaitMeter`: fetch and decode, and the Kafka offset commit / file progress persist on finalize |
+| Plugin source | `WrappingExec` input poll (the plugin's fetch and decode run out of process, so it is never split) | none |
+| Sink | `WrappingDataSink` input poll | time the connector holds a batch before it asks for the next one |
+
+A task-decoupled operator must claim the `TaskWaitMeter` (`telemetry/task_wait.rs`) its wrapper installs in the `TaskContext`, and bracket its input waits (`next`, `wait_input`), sends (`send`), and waits on the sinks (`untimed`, in no state); otherwise its work reads as `starved`. Its send wait is the edge's `blocked`, except while the wrapper itself works on a batch (side outputs): that pause is in no state. An operator that runs inner sources one after another reserves the meter (`TaskWaitMeter::reserve`) and lets each claim it in turn. The inner sources' own `WrappingExec`s share that reserved meter and emit no `node_wait`, so a hybrid source's whole triad is under its YAML name. The hybrid driver times its normalize work (`busy`) and edge sends (`blocked`) through the `ReservedMeter` that `reserve` returns.
+
+Every series is a `NodeTime` (`telemetry/node_time.rs`): a process-wide flusher reports open spans every second, so a stalled wait shows while it lasts. An input wait pauses when the input wakes the task (`telemetry/wake_timed.rs`, switched in the waker so it shows live), not when a prefetching consumer (`ready_chunks`) polls again: the gap is that consumer's `busy` (sink) or the edge's `blocked`. Whole milliseconds are emitted and the sub-millisecond remainder carries.
+
+Every `node_wait` series carries `id=<node>`, `state`, and `downstream_id` (empty for `starved`, `busy`, and unresolved `blocked`). Each partition of a node adds into the same series, so a node with N partitions can accrue N seconds per second: compare states as ratios, not as absolute rates.
+
+> **`elapsed_compute` compatibility.** A `WrappingExec` node still records its input poll time per delivered batch as `elapsed_compute`, as on `main`, so existing latency panels keep their meaning. A SQL transform's observation is its subtree compute only (one without subtree metrics records poll time). The poll-time observation is temporary (STRM-6760): it goes once dashboards read `state="busy"` and a batch counter. Do not derive busy from `elapsed_compute`; use `state="busy"`. Sink `elapsed_compute` is connector-recorded service time.
+
+**`blocked`** is modeled as a property of an **edge** (`producer → consumer`): the `downstream_id` names the consumer, so a linear chain is a sequence of single edges and a fan-out is several edges. The core invariant is **exactly one blocked emitter per edge**:
+
+- A single-downstream node's `WrappingExec` emits its one edge (`id=self, downstream_id=the_consumer`), measured as yield→resume suspension. When the node's operator claims the `TaskWaitMeter`, the wrapper hands that series to the meter and the edge is measured as the task's output send wait instead. A channel operator that does not claim it (`CheckpointableExec`, `PluginSourceExec`) keeps yield→resume, and its task works on while the wrapper is blocked until its channel fills.
+- A **fan-out producer** (feeding a multi-sink or scan-sharing `BroadcastStream`) has its `WrappingExec` blocked emission **suppressed**; the `BroadcastStream` emits one edge per consumer (`id=producer, downstream_id=each_consumer`), measured as blocked-send time on each consumer's channel. `each_consumer` is the **immediate** downstream: for a multi-sink fan-out that is each terminal sink; for a scan-sharing fan-out that is each consuming transform reading the shared source (falling back to the sink only when a sink reads the shared source directly, with no transform in between).
+
+Because only one of these emitters (wrapper yield→resume, task output send, `BroadcastStream` send) ever times a given edge, no single edge is ever counted twice, and `... by (downstream_id)` is always the correct per-consumer signal. A fan-out producer sends to all consumers concurrently (`join_all`), so its per-edge blocked spans overlap: for the producer's own blocked time take the slowest edge, `max by (id) (sum by (id, downstream_id) (rate(...)))`. The only `downstream_id=""` blocked series is a rare fallback where a linear node's downstream name can't be resolved.
+
+**`streamling_node_empty_batches_total`** counts zero-row data batches a `WrappingExec` emitted. A zero-row batch that carries checkpoint messages is control traffic and is not counted. A node with a rising empty count and flat `output_rows` runs but moves no rows. A source-level `filter` runs between the source's `SourceInput` wrapper (side outputs, `node_wait`, empty batches: pre-filter) and its `SourceOutput` wrapper (`output_rows`: post-filter), so the batches it empties count on the consumer, and its compute is the consumer's `starved`; check the source's filter before blaming the consumer. Each stream banks this count and sends it with `node_wait`: once per second, and when the stream ends or is dropped.
+
+Blocked attribution is stamped by the `DownstreamAttributionRule` physical-optimizer pass (`optimizer.rs`); scan-sharing producers are suppressed at construction (they are unreachable by the pass).
 
 ## Key Architecture Concepts
 
