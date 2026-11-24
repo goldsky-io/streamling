@@ -646,6 +646,50 @@ mod tests {
         );
     }
 
+    /// A pause left unresumed (a wrapper cancelled mid-batch) freezes later
+    /// spans; it never banks the time since the pause.
+    #[test]
+    fn an_unresumed_pause_banks_nothing_later() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "node_time::unresumed_pause";
+        init_recorder_with_node(id);
+        let timer = NodeTime::wall(get_metrics_recorder(), id, "blocked", "down");
+
+        timer.pause();
+        std::thread::sleep(Duration::from_millis(30));
+        timer.open();
+        std::thread::sleep(Duration::from_millis(10));
+        timer.close();
+        assert!(
+            timer.total() < Duration::from_millis(1),
+            "{:?}",
+            timer.total()
+        );
+    }
+
+    /// An operator send that closes during the wrapper's own work must not
+    /// lift the wrapper's pause: the rest of that work is not blocked time.
+    #[test]
+    fn a_send_closed_mid_pause_keeps_the_pause() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id = "node_time::close_mid_pause";
+        init_recorder_with_node(id);
+        let timer = NodeTime::wall(get_metrics_recorder(), id, "blocked", "down");
+
+        timer.pause();
+        timer.open();
+        timer.close();
+        timer.open();
+        std::thread::sleep(Duration::from_millis(30));
+        timer.resume();
+        timer.close();
+        assert!(
+            timer.total() < Duration::from_millis(5),
+            "{:?}",
+            timer.total()
+        );
+    }
+
     /// A failed flusher start is retried later, at most once per interval,
     /// and never again once it runs.
     #[test]
