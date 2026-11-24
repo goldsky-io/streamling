@@ -203,6 +203,7 @@ impl WakeTimed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::node_time::hold_flusher;
     use crate::telemetry::recorder::get_metrics_recorder;
     use crate::telemetry::recorder::test_support::{TEST_LOCK, init_recorder_with_node};
     use datafusion::arrow::datatypes::Schema;
@@ -289,15 +290,18 @@ mod tests {
             id,
         );
 
+        // A flusher tick inside the error's wait would bank part of it.
+        let _held = hold_flusher();
         assert!(input.next().await.unwrap().is_err());
+        let asked_at = Instant::now();
         assert!(input.next().await.unwrap().is_ok());
+        let wait = asked_at.elapsed();
         let delivered = starved.total();
         assert!(input.next().await.is_none());
         assert_eq!(starved.total(), delivered, "end-of-stream adds nothing");
-        // The 1s flusher may bank part of the error's wait, never all of it.
         assert!(
-            delivered >= Duration::from_millis(20) && delivered < Duration::from_millis(40),
-            "{delivered:?}"
+            delivered >= Duration::from_millis(20) && delivered <= wait,
+            "only the delivering wait ({wait:?}), got {delivered:?}"
         );
     }
 

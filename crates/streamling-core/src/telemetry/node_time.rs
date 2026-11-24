@@ -504,6 +504,7 @@ mod tests {
         init_recorder_with_node(id);
         let timer = NodeTime::wall(get_metrics_recorder(), id, "blocked", "down");
 
+        let opened = Instant::now();
         timer.open();
         std::thread::sleep(FLUSH_INTERVAL * 2 + Duration::from_millis(300));
         // No manual flush: the background flusher reports the open span.
@@ -514,10 +515,12 @@ mod tests {
         );
 
         timer.close();
+        let span = opened.elapsed().as_millis() as u64;
         let closed = node_wait_ms(id, "blocked", Some("down"));
+        // A loaded runner can overshoot the sleep, so bound by the real span.
         assert!(
-            (2_300..3_000).contains(&closed),
-            "closed span = its wall time, got {closed}ms"
+            (2_300..=span).contains(&closed),
+            "closed span = its wall time ({span}ms), got {closed}ms"
         );
     }
 
@@ -594,12 +597,14 @@ mod tests {
         starved.flush();
         std::thread::sleep(Duration::from_millis(20));
         // The whole span was one poll of compute.
-        compute.add_duration(started.elapsed());
+        let recorded_at = Instant::now();
+        compute.add_duration(recorded_at - started);
         starved.close();
-        // Only the µs between recording the compute and the close remain.
+        let tail = recorded_at.elapsed();
+        // Only the time between recording the compute and the close remains.
         assert!(
-            starved.total() < Duration::from_millis(1),
-            "{:?}",
+            starved.total() <= tail,
+            "tail {tail:?}, got {:?}",
             starved.total()
         );
 
@@ -660,11 +665,7 @@ mod tests {
         timer.open();
         std::thread::sleep(Duration::from_millis(10));
         timer.close();
-        assert!(
-            timer.total() < Duration::from_millis(1),
-            "{:?}",
-            timer.total()
-        );
+        assert_eq!(timer.total(), Duration::ZERO);
     }
 
     /// An operator send that closes during the wrapper's own work must not
