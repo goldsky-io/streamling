@@ -2471,6 +2471,70 @@ mod tests {
         );
     }
 
+    /// A filtered claiming source (Kafka) through the real wrapper pair: the
+    /// source's task reports `starved`, `busy` and `blocked` once. The
+    /// `SourceOutput` wrapper's meter stays unclaimed, so a starved gate that
+    /// ignored its role would add its input wait as a second `starved`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn filtered_claiming_source_measures_node_wait_once() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "filtered_claiming_source";
+        test_support::init_recorder_with_node(node_id);
+
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch).take(4).collect();
+        let mem_table = MemTable::try_new(test_schema(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let source: Arc<dyn ExecutionPlan> = Arc::new(BufferedWorkExec {
+            inner: Arc::new(SlowInputExec {
+                inner: source_exec,
+                per_batch_delay: Duration::from_millis(10),
+            }),
+            work: Duration::from_millis(10),
+            capacity: 1,
+        });
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = Arc::new(
+            StreamingFilterExec::from_original(FilterExec::try_new(predicate, source).unwrap())
+                .unwrap(),
+        );
+        let plan = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            filter,
+            node_id,
+            vec![],
+            None,
+            None,
+            false,
+        );
+
+        let started = Instant::now();
+        let mut stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        // The task fills the 1-slot channel before the first poll: blocked.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+        let elapsed = started.elapsed().as_millis() as u64;
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some(""));
+        assert!(starved >= 30, "4 x 10ms input waits, got {starved}ms");
+        assert!(busy >= 30, "4 x 10ms task work, got {busy}ms");
+        assert!(blocked >= 10, "send into a full channel, got {blocked}ms");
+        // The task's states are disjoint spans of the run; a second emitter
+        // under the source id pushes the sum past it.
+        assert!(
+            starved + busy + blocked <= elapsed,
+            "starved {starved} + busy {busy} + blocked {blocked} > elapsed {elapsed}ms"
+        );
+    }
+
     /// Claims the meter like a task-decoupled operator (Kafka source,
     /// handler): a spawned task reads the input, works `work` per batch, and
     /// sends into a bounded channel the stream reads.
