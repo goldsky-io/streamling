@@ -1288,8 +1288,8 @@ impl CheckpointCoordinator {
             };
             if let Some((state, unacked)) = unacked {
                 warn!(
-                    "Terminal checkpoint epoch {} never finalized before coordinator stop (unacked sink(s): {:?}); recording it as failed (offsets stay uncommitted; the tail replays on restart)",
-                    epoch.0, unacked
+                    "Terminal checkpoint epoch {} ({}) never finalized before coordinator stop (unacked sink(s): {:?}); recording it as failed (offsets stay uncommitted; the tail replays on restart)",
+                    epoch.0, state, unacked
                 );
                 let metrics_recorder = get_checkpoint_metrics_recorder();
                 metrics_recorder.record_count("checkpoint_epochs_failed", 1);
