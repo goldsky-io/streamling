@@ -293,10 +293,9 @@ async fn test_multi_sink_backpressure_attribution() {
         .await
         .expect("Failed to register schema");
 
-    // Slow sink: each webhook request blocks 100ms. With a default broadcast
-    // buffer of 10, the producer fills the webhook consumer's channel then
-    // blocks on it, accruing attributed blocked-send time while the fast
-    // Postgres sink drains freely.
+    // Slow sink: each webhook request blocks 100ms. The pipeline env below makes
+    // the webhook serial (one in-flight request, one buffered batch); otherwise
+    // it runs 25 requests concurrently and the broadcast barely blocks on it.
     let webhook = WebhookResource::new()
         .await
         .expect("Failed to start webhook server");
@@ -355,7 +354,9 @@ sinks:
             PipelineOpts::new()
                 .record_limit(records_to_produce as u64)
                 .timeout(std::time::Duration::from_secs(120))
-                .env("STREAMLING__RECORD_BATCH_SIZE", "1"),
+                .env("STREAMLING__RECORD_BATCH_SIZE", "1")
+                .env("STREAMLING__INTERNAL_BUFFER_SIZE", "1")
+                .env("STREAMLING__EXTERNAL_HTTP_HANDLER__BUFFER_SIZE", "1"),
         )
         .await
         .expect("Streamling execution failed");
@@ -390,8 +391,6 @@ sinks:
     // Give metrics time to flush to Prometheus.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    // Aggregate across series (sum) so cross-run series from other tests only
-    // add to the total and cannot mask this run's backpressure.
     let blocked_webhook_query = format!(
         "sum({})",
         PrometheusResource::backpressure_by_downstream_query("webhook_sink", Some(&ctx.test_id))
@@ -408,17 +407,18 @@ sinks:
     // The source feeds a multi-sink fan-out, so its WrappingExec is suppressed
     // and it no longer emits its own node series — its backpressure surfaces only
     // as per-edge series (one per downstream sink). Sum across `id="kafka_source"`
-    // to recover the node-level total.
+    // to recover the node-level total. That total includes the
+    // kafka_source -> webhook_sink edge, so it is at least `blocked_webhook`.
     let source_backpressure_query = format!(
         "sum({})",
         PrometheusResource::backpressure_by_id_query("kafka_source", Some(&ctx.test_id))
     );
     let source_backpressure = prometheus
-        .wait_for_metric_at_least(&source_backpressure_query, 1, 30, 500)
+        .wait_for_metric_at_least(&source_backpressure_query, blocked_webhook, 30, 500)
         .await
         .expect("source must be backpressured by the stalled fan-out");
     assert!(
-        source_backpressure >= 1,
+        source_backpressure >= blocked_webhook,
         "expected the source to register backpressure, got {source_backpressure}ms"
     );
 }
