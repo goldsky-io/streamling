@@ -1626,6 +1626,7 @@ impl Streamling {
                                 format!("plugin-forwarders:{reference_name}"),
                                 streamling_core::shutdown::DrainStage::PostPlugin,
                             ),
+                            drain_on_shutdown.then(|| checkpoint_control.clone()),
                         ));
 
                     let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(

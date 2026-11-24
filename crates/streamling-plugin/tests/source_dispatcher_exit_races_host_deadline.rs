@@ -116,6 +116,8 @@ async fn source_dispatcher_exits_promptly_after_terminate() {
         TD_Opaque,
     ));
 
+    // This test is the host: probing records that it supports source drain protocol 1.
+    streamling_plugin::source_drain_protocol();
     let chans = PluginChannels {
         input: PluginChannel::new(crossbeam_channel::bounded(50)),
         output: PluginChannel::new(crossbeam_channel::bounded(1)), // set_plugin_output_buffer!("solana_source", 1)

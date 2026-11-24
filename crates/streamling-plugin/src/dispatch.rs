@@ -204,6 +204,7 @@ async fn handle_control_messages(
                 // buffered work they hold is flushed before the library goes
                 // quiet. No-op when nothing was tracked.
                 crate::shutdown::drain_tracked().await;
+                return Ok(());
             }
             Err(e) => {
                 return Err(PluginError::Execution(format!(
@@ -301,6 +302,19 @@ where
     Err(error)
 }
 
+/// Engine and source SDK must agree on the data-boundary drain protocol.
+pub const SOURCE_DRAIN_PROTOCOL_VERSION: u32 = 1;
+
+static SOURCE_DRAIN_HOST_ACCEPTED: AtomicBool = AtomicBool::new(false);
+
+/// Called by the host before constructing a source. Besides advertising the
+/// version, this proves the host will consume through the data boundary.
+/// An older host never probes this suffix, so its source fails before I/O.
+pub extern "C" fn source_drain_protocol() -> u32 {
+    SOURCE_DRAIN_HOST_ACCEPTED.store(true, Ordering::SeqCst);
+    SOURCE_DRAIN_PROTOCOL_VERSION
+}
+
 pub struct SourcePluginDispatcher {
     channels: PluginChannels,
     source_plugin: Arc<dyn SourcePlugin>,
@@ -315,6 +329,29 @@ impl SourcePluginDispatcher {
     }
 
     pub async fn start(&self, runtime: PluginAsyncRuntimeObj) -> Result<(), PluginError> {
+        self.start_with_host_protocol(runtime, SOURCE_DRAIN_HOST_ACCEPTED.load(Ordering::SeqCst))
+            .await
+    }
+
+    async fn start_with_host_protocol(
+        &self,
+        runtime: PluginAsyncRuntimeObj,
+        host_accepted: bool,
+    ) -> Result<(), PluginError> {
+        if !host_accepted {
+            return Err(PluginError::Execution(
+                "host does not support source drain protocol 1; upgrade the engine together with the source plugin library".into(),
+            ));
+        }
+        self.start_until_shutdown(runtime, crate::shutdown::is_shutting_down)
+            .await
+    }
+
+    async fn start_until_shutdown(
+        &self,
+        runtime: PluginAsyncRuntimeObj,
+        shutdown_requested: impl Fn() -> bool,
+    ) -> Result<(), PluginError> {
         // If the host sends `Terminate` before `Init` (validation / early-teardown
         // path), short-circuit before `initialize()` runs. This is the contract
         // plugin authors rely on when keeping runtime I/O out of `new()`: the
@@ -333,62 +370,74 @@ impl SourcePluginDispatcher {
         }
         self.source_plugin.initialize().await?;
         let mut beacon = LivenessBeacon::new(&self.channels);
-        let host_terminated = Arc::new(AtomicBool::new(false));
+        let host_terminated = AtomicBool::new(false);
+        let mut completed = false;
+        let send_error = Arc::new(std::sync::Mutex::new(None));
 
         loop {
             beacon.beat();
-            // Generation loop
-            // The idea is to continuously generate batches from the source plugin
-            // and send them to the output channel, BUT it needs to occasionally check
-            // the input channel for control messages (checkpoint markers, etc.). So there is
-            // a timeout that's used to exit the generation loop and check the input channel.
-            let source_plugin = self.source_plugin.clone();
-
-            if !source_plugin.is_running() {
-                break;
+            // A source ends its data stream at a batch boundary, but keeps
+            // servicing finalizers until the host has drained the sinks.
+            if !completed && (shutdown_requested() || !self.source_plugin.is_running()) {
+                // Best effort: if the host stopped reading, the missing boundary reads as
+                // "not drained", so the epoch stays unacked and the tail replays.
+                if let Err(error) = self
+                    .channels
+                    .output
+                    .send_with_retry(&runtime, "Source complete", || {
+                        NonExhaustive::new(PluginMsg::Terminate)
+                    })
+                    .await
+                {
+                    warn!("Failed to notify host of source completion: {:?}", error);
+                }
+                completed = true;
             }
 
-            let runtime_clone = runtime.clone();
-            let channels_clone = self.channels.clone();
-            let source_plugin_clone = self.source_plugin.clone();
-            let host_terminated_clone = host_terminated.clone();
-            let generate_batch_future = async move {
-                match source_plugin.generate_batch().await {
-                    Ok(batch) => {
-                        let retry_callback = || -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
-                            let channels = channels_clone.clone();
-                            let source_plugin = source_plugin_clone.clone();
-                            let runtime = runtime_clone.clone();
-                            let host_terminated = host_terminated_clone.clone();
-                            Box::pin(async move {
-                                // Handle control messages in case the output channel is full
-                                let _ = handle_control_messages(&channels, &source_plugin, &runtime, &host_terminated).await;
-                                // Check if plugin is still running
-                                source_plugin.is_running()
-                            })
-                        };
-
-                        let _ = channels_clone.output.send_with_retry_callback(
-                            &runtime_clone,
-                            "Source plugin",
-                            || {
-                                let batch_data: SafeArrowArray = batch.clone().into();
-                                NonExhaustive::new(PluginMsg::NextBatch { data: batch_data })
-                            },
-                            Some(retry_callback),
-                            Duration::from_millis(50),
-                        )
-                        .await;
-                        // Ignore errors - source plugin doesn't propagate them
-                    }
-                    Err(e) => {
-                        error!("Error generating batch: {:?}", e);
-                    }
+            if !completed {
+                let source_plugin = self.source_plugin.clone();
+                let channels = self.channels.clone();
+                let runtime_clone = runtime.clone();
+                let send_error_clone = send_error.clone();
+                runtime
+                    .spawn(
+                        async move {
+                            match source_plugin.generate_batch().await {
+                                Ok(batch) => {
+                                    // Never process a marker while this batch is
+                                    // waiting for output capacity: its cursor may
+                                    // already include the batch. FIFO enqueue must
+                                    // precede checkpoint hooks and their output.
+                                    if let Err(error) = channels
+                                        .output
+                                        .send_with_retry(&runtime_clone, "Source plugin", || {
+                                            NonExhaustive::new(PluginMsg::NextBatch {
+                                                data: batch.clone().into(),
+                                            })
+                                        })
+                                        .await
+                                    {
+                                        *send_error_clone.lock().expect("source send error lock") =
+                                            Some(error);
+                                    }
+                                }
+                                Err(error) => error!("Error generating batch: {:?}", error),
+                            }
+                        }
+                        .into_ffi(),
+                    )
+                    .await;
+                let error = send_error.lock().expect("source send error lock").take();
+                if let Some(error) = error {
+                    return drain_discard_after_failure(
+                        &self.channels,
+                        &runtime,
+                        error,
+                        self.source_plugin.terminate(),
+                    )
+                    .await;
                 }
             }
-            .into_ffi();
-
-            runtime.spawn(generate_batch_future).await;
 
             // A failing checkpoint hook must not exit with a possibly-full
             // input channel behind it — the host-side control writer would
@@ -410,35 +459,13 @@ impl SourcePluginDispatcher {
                 )
                 .await;
             }
+            if host_terminated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if completed {
+                runtime.sleep(IDLE_POLL_INTERVAL.into()).await;
+            }
         }
-
-        // Terminate during process shutdown: the host stopped reading output
-        // at the signal, so the send can only block on a full channel until
-        // the drain deadline. Outside shutdown the host still reads and uses
-        // this message to tell a clean exit from an unexpected one.
-        if host_terminated.load(Ordering::SeqCst) && crate::shutdown::is_shutting_down() {
-            return Ok(());
-        }
-
-        // The source stopped on its own (`is_running()` went false — bounded
-        // work complete). Tell the host so it can end this source's
-        // record-batch stream: without the signal a bounded job's sinks never
-        // see end-of-stream and the pipeline cannot complete. Output-direction
-        // Terminate is the completion signal (see its doc on `PluginMsg` for
-        // why no new variant can be added). A host predating this meaning
-        // ignores it.
-        if let Err(e) = self
-            .channels
-            .output
-            .send_with_retry(&runtime, "Source complete", || {
-                NonExhaustive::new(PluginMsg::Terminate)
-            })
-            .await
-        {
-            warn!("Failed to notify host of source completion: {:?}", e);
-        }
-
-        Ok(())
     }
 }
 
@@ -814,11 +841,27 @@ mod tests {
     use async_trait::async_trait;
 
     fn make_channels() -> PluginChannels {
+        source_drain_protocol();
         PluginChannels {
             input: PluginChannel::new(crossbeam_channel::bounded(8)),
             output: PluginChannel::new(crossbeam_channel::bounded(8)),
             metrics: PluginMetricsChannel::new(crossbeam_channel::bounded(8)),
         }
+    }
+
+    #[tokio::test]
+    async fn source_drain_rejects_old_host_before_initialization() {
+        let channels = make_channels();
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let source = Arc::new(RecordingSource::new(recorder.clone()));
+        let dispatcher = SourcePluginDispatcher::new(channels.clone(), source);
+        let error = dispatcher
+            .start_with_host_protocol(DirectTokioProxy::new().into_async_runtime_obj(), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("upgrade the engine"), "{error}");
+        assert!(!recorder.was_initialized());
+        assert!(channels.output.receiver.is_empty());
     }
 
     struct FailingPreprocessor {
@@ -1233,19 +1276,213 @@ mod tests {
             .unwrap();
 
         let runtime = DirectTokioProxy::new().into_async_runtime_obj();
-        SourcePluginDispatcher::new(channels.clone(), plugin)
-            .start(runtime)
-            .await
-            .unwrap();
+        let dispatcher = SourcePluginDispatcher::new(channels.clone(), plugin);
+        let host = async {
+            loop {
+                if let Ok(message) = channels.output.receiver.try_recv()
+                    && matches!(message.into_enum(), Ok(PluginMsg::Terminate))
+                {
+                    channels
+                        .input
+                        .sender
+                        .send(NonExhaustive::new(PluginMsg::Terminate))
+                        .unwrap();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(dispatcher.start(runtime), host)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+    }
 
-        let mut last = None;
-        while let Ok(m) = channels.output.receiver.try_recv() {
-            last = Some(m.into_enum());
+    struct CheckpointSource {
+        cursor: AtomicUsize,
+        marked: AtomicUsize,
+        committed: AtomicUsize,
+        terminated: AtomicBool,
+    }
+
+    #[async_trait]
+    impl SupportsGracefulShutdown for CheckpointSource {
+        fn is_running(&self) -> bool {
+            !self.terminated.load(Ordering::SeqCst)
         }
-        assert!(
-            matches!(last, Some(Ok(PluginMsg::Terminate))),
-            "bounded source must signal completion with output Terminate, got {last:?}"
-        );
+
+        async fn terminate(&self) -> Result<(), PluginError> {
+            self.terminated.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourcePlugin for CheckpointSource {
+        async fn initialize(&self) -> Result<(), PluginError> {
+            Ok(())
+        }
+
+        fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+            Ok(Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "id",
+                arrow::datatypes::DataType::Int64,
+                false,
+            )])))
+        }
+
+        async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+            let cursor = self.cursor.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(RecordBatch::try_new(
+                self.output_schema()?,
+                vec![Arc::new(arrow::array::Int64Array::from(vec![
+                    cursor as i64,
+                ]))],
+            )
+            .unwrap())
+        }
+
+        async fn process_checkpoint_marker(
+            &self,
+            _: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            self.marked
+                .store(self.cursor.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn process_checkpoint_finalizer(
+            &self,
+            _: crate::api::CheckpointEpoch,
+        ) -> Result<(), PluginError> {
+            self.committed
+                .store(self.marked.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn source_drain_preserves_pending_data_before_markers_and_finalizers() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut channels = make_channels();
+            channels.output = PluginChannel::new(crossbeam_channel::bounded(1));
+            let source = Arc::new(CheckpointSource {
+                cursor: AtomicUsize::new(0),
+                marked: AtomicUsize::new(0),
+                committed: AtomicUsize::new(0),
+                terminated: AtomicBool::new(false),
+            });
+            // Occupy the entire output queue before generation starts.
+            channels
+                .output
+                .sender
+                .send(NonExhaustive::new(PluginMsg::NextBatch {
+                    data: RecordBatch::new_empty(source.output_schema().unwrap()).into(),
+                }))
+                .unwrap();
+            channels
+                .input
+                .sender
+                .send(NonExhaustive::new(PluginMsg::Init))
+                .unwrap();
+            channels
+                .input
+                .sender
+                .send(NonExhaustive::new(PluginMsg::CheckpointMarker {
+                    epoch: PluginCheckpointEpoch(7),
+                }))
+                .unwrap();
+            let stop = AtomicBool::new(false);
+            let calls = RuntimeCalls::default();
+            let dispatcher = SourcePluginDispatcher::new(channels.clone(), source.clone());
+            let host = async {
+                // The runtime's retry sleep is a barrier: generation has
+                // advanced the cursor, but enqueue is blocked on capacity.
+                while calls.sleeps.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(source.cursor.load(Ordering::SeqCst), 1);
+                assert_eq!(source.marked.load(Ordering::SeqCst), 0);
+                assert_eq!(source.committed.load(Ordering::SeqCst), 0);
+                stop.store(true, Ordering::SeqCst);
+                channels.output.receiver.try_recv().unwrap();
+                let batch = loop {
+                    if let Ok(message) = channels.output.receiver.try_recv() {
+                        match message.into_enum().unwrap() {
+                            PluginMsg::NextBatch { data } => break RecordBatch::from(data),
+                            other => panic!("checkpoint overtook undelivered data: {other:?}"),
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                };
+                assert_eq!(batch.num_rows(), 1);
+                assert_eq!(source.committed.load(Ordering::SeqCst), 0);
+                loop {
+                    if let Ok(message) = channels.output.receiver.try_recv() {
+                        assert!(matches!(
+                            message.into_enum().unwrap(),
+                            PluginMsg::CheckpointMarker { .. }
+                        ));
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                // Leave completion in the capacity-one queue, then queue a
+                // durable finalizer and Terminate behind it.
+                while channels.output.receiver.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                channels
+                    .input
+                    .sender
+                    .send(NonExhaustive::new(PluginMsg::CheckpointFinalizer {
+                        epoch: PluginCheckpointEpoch(7),
+                    }))
+                    .unwrap();
+                channels
+                    .input
+                    .sender
+                    .send(NonExhaustive::new(PluginMsg::Terminate))
+                    .unwrap();
+                while source.committed.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(!source.terminated.load(Ordering::SeqCst));
+                assert!(matches!(
+                    channels
+                        .output
+                        .receiver
+                        .try_recv()
+                        .unwrap()
+                        .into_enum()
+                        .unwrap(),
+                    PluginMsg::Terminate
+                ));
+                loop {
+                    if let Ok(message) = channels.output.receiver.try_recv() {
+                        assert!(matches!(
+                            message.into_enum().unwrap(),
+                            PluginMsg::CheckpointFinalizer { .. }
+                        ));
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            let (result, ()) = tokio::join!(
+                dispatcher
+                    .start_until_shutdown(counting_runtime(&calls), || stop.load(Ordering::SeqCst)),
+                host,
+            );
+            result.unwrap();
+            assert!(source.terminated.load(Ordering::SeqCst));
+            assert_eq!(source.cursor.load(Ordering::SeqCst), 1);
+            assert_eq!(source.committed.load(Ordering::SeqCst), 1);
+        })
+        .await
+        .expect("full bounded channels must not wedge finalizer/Terminate");
     }
 
     #[tokio::test]

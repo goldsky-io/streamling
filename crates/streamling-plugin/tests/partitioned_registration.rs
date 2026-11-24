@@ -269,6 +269,8 @@ fn input_schema() -> ROption<SafeArrowSchema> {
 }
 
 fn test_channels() -> PluginChannels {
+    // This test is the host: probing records that it supports source drain protocol 1.
+    streamling_plugin::source_drain_protocol();
     PluginChannels {
         input: PluginChannel::new(crossbeam_channel::bounded(8)),
         output: PluginChannel::new(crossbeam_channel::bounded(8)),

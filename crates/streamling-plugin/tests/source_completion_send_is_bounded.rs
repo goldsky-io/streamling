@@ -122,6 +122,8 @@ async fn source_dispatcher_exits_when_the_host_stopped_reading_its_output() {
         },
         TD_Opaque,
     ));
+    // This test is the host: probing records that it supports source drain protocol 1.
+    streamling_plugin::source_drain_protocol();
 
     let chans = PluginChannels {
         input: PluginChannel::new(crossbeam_channel::bounded(8)),

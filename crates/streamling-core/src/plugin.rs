@@ -865,6 +865,19 @@ fn collect_labels(labels: abi_stable::std_types::RVec<PluginLabel>) -> Vec<(Stri
         .collect()
 }
 
+fn require_source_drain_protocol(module: &PluginModuleRef, plugin_type: &PluginId) -> Result<()> {
+    if module.source_drain_protocol().map(|probe| probe()) != Some(1)
+        || module.set_shutdown_signal().is_none()
+    {
+        return Err(streamling_user_err!(
+            "source plugin '{}' does not support source drain protocol 1; rebuild its library \
+             against the matching Streamling SDK before running this engine",
+            plugin_type
+        ));
+    }
+    Ok(())
+}
+
 pub fn create_source_plugin(
     app_config: &AppConfig,
     reference_name: String,
@@ -873,6 +886,7 @@ pub fn create_source_plugin(
 ) -> Result<InitializedPlugin> {
     let plugin_type: PluginId = plugin_type.into();
     let plugin_module = require_plugin(&plugin_type)?;
+    require_source_drain_protocol(&plugin_module, &plugin_type)?;
     let plugin_async_runtime = create_plugin_async_runtime(Handle::current());
     let plugin_state_backend_config =
         create_plugin_state_backend_config(app_config, &reference_name);
@@ -1284,6 +1298,33 @@ mod tests {
             )),
             "error should name what is actually loaded: {msg}"
         );
+    }
+
+    #[test]
+    fn source_drain_rejects_incompatible_plugin_module() {
+        use abi_stable::prefix_type::PrefixTypeTrait;
+        extern "C" fn old_protocol() -> u32 {
+            0
+        }
+        let current = test_plugins::get_module();
+        let plugin_id: PluginId = "source-drain-compatibility".to_string().into();
+        require_source_drain_protocol(&current, &plugin_id).unwrap();
+        let old = streamling_plugin::PluginModule {
+            init: current.init(),
+            create: current.create(),
+            udf_descriptors: current.udf_descriptors().unwrap(),
+            side_output_descriptors: current.side_output_descriptors().unwrap(),
+            set_shutdown_signal: current.set_shutdown_signal().unwrap(),
+            describe_partitioned: current.describe_partitioned().unwrap(),
+            create_partitioned: current.create_partitioned().unwrap(),
+            source_drain_protocol: old_protocol,
+        }
+        .leak_into_prefix();
+        let error = require_source_drain_protocol(&old, &plugin_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("source drain protocol 1"), "{error}");
+        assert!(error.contains("rebuild"), "{error}");
     }
 
     /// Regression: unknown plugins used to `panic!("Plugin {} not found!")`.

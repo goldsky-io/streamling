@@ -125,6 +125,10 @@ extern "C" fn create_partitioned(
     Err(PluginInitializationError::NotImplemented).into_c()
 }
 
+extern "C" fn source_drain_protocol() -> u32 {
+    0 // This library implements only a sink.
+}
+
 #[export_root_module]
 pub fn get_module() -> PluginModuleRef {
     PluginModule {
@@ -135,6 +139,7 @@ pub fn get_module() -> PluginModuleRef {
         set_shutdown_signal,
         describe_partitioned,
         create_partitioned,
+        source_drain_protocol,
     }
     .leak_into_prefix()
 }

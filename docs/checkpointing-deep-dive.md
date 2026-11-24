@@ -25,6 +25,54 @@ Sources commit positions on Finalizer.
 
 The invariant: **sources never commit positions until ALL sinks have durably written all data up to that point.**
 
+### Plugin source shutdown
+
+The source dispatcher finishes enqueueing its current batch before running
+checkpoint hooks. A full bounded output channel must not let a marker overtake
+the rows covered by its cursor.
+
+On shutdown the dispatcher stops generating batches and emits output `Terminate`
+as the end-of-data boundary. The host consumes through that boundary rather than
+sampling the queue length. The dispatcher remains alive for checkpoint finalizers
+until the host sends input `Terminate`.
+
+In drain mode the host begins the coordinator's existing terminal checkpoint
+after consuming the data boundary, then sends its marker through the source.
+Sinks flush and acknowledge this marker without waiting for source EOF. The
+coordinator stays alive during this exchange. The source stream ends only after
+the terminal finalizer returns from the SDK, confirming its persistence hook
+completed. The host sends no controls behind that finalizer, so the output queue
+cannot refill after EOF. Metrics retain their separate post-plugin scope.
+
+Explicit fast mode does not mint a terminal checkpoint. It consumes every data
+batch and every already-sent control echo before EOF; unsent checkpoints remain
+uncommitted and the tail replays. Dry-run does not execute source streams or
+start the coordinator. Markers that never completed the source roundtrip are
+not fabricated downstream.
+
+This requires source drain protocol 1. The host probes the plugin module before
+constructing a source; the probe also records host support in that library's SDK.
+An old library fails with a rebuild-required error. An old host never calls the
+probe, so a new source dispatcher fails with an engine-upgrade-required error
+before initialization or data generation. Rebuild and ship the engine and source
+plugin together. Existing sink, transform, UDF and preprocessor libraries do not
+need the source capability.
+
+The source libraries in the local integration are `goldsky_plugins` (all 21
+registered source types, not just Flopmark) and the `basic` plugin example
+(single-stream and partitioned sources). The low-level example contains only a
+sink. A Flopmark feature flag does not isolate this shared SDK compatibility
+change. A source bundle can require the SDK at compile time with
+`streamling_plugin::SOURCE_DRAIN_PROTOCOL_VERSION`.
+
+The initial shutdown reaches the source via the host-installed FFI
+`ShutdownSignal`, not the later input `Terminate`. Source hooks must still
+snapshot only acknowledged positions; a source that acknowledges on its next
+generation call may replay its last delivered batch after shutdown.
+Checkpoint hooks must remain usable after a bounded source reports
+`is_running() == false`; that stops data generation, not finalization.
+Release checkpoint resources in `terminate()`, after the host's input Terminate.
+
 ---
 
 ## Protocol Phases

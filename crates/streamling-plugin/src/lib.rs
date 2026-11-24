@@ -15,8 +15,8 @@ pub use crate::api::{
 };
 use crate::r#async::PluginAsyncRuntimeObj;
 pub use crate::dispatch::{
-    PreprocessorPluginDispatcher, SinkPluginDispatcher, SourcePluginDispatcher,
-    TransformPluginDispatcher,
+    PreprocessorPluginDispatcher, SOURCE_DRAIN_PROTOCOL_VERSION, SinkPluginDispatcher,
+    SourcePluginDispatcher, TransformPluginDispatcher, source_drain_protocol,
 };
 use crate::ffi::PluginMetricsRecorder;
 pub use crate::ffi::SafeArrowSchema;
@@ -1520,6 +1520,8 @@ mod partitioned_generator_tests {
     }
 
     fn channels() -> PluginChannels {
+        // This test is the host: probing records that it supports source drain protocol 1.
+        source_drain_protocol();
         PluginChannels {
             input: PluginChannel::new(crossbeam_channel::bounded(8)),
             output: PluginChannel::new(crossbeam_channel::bounded(8)),
@@ -1712,6 +1714,13 @@ pub struct PluginModule {
         state_backend_config: PluginStateBackendConfig,
         message_channels: PluginChannels,
     ) -> RResult<PluginResult, PluginInitializationError>,
+
+    /// Bidirectional source drain protocol probe. Version 1 quiesces generation
+    /// on the installed shutdown signal, sends output Terminate after the last
+    /// batch, and serves finalizers until input Terminate. Calling the probe
+    /// also tells the SDK the host supports this ordering. Without the probe,
+    /// the source dispatcher rejects an old host before initialization.
+    pub source_drain_protocol: extern "C" fn() -> u32,
 }
 
 impl RootModule for PluginModuleRef {

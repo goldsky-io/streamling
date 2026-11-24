@@ -258,6 +258,9 @@ impl PartitionedPlugin {
             Ok(None)
         };
         let module = require_plugin(&plugin_type)?;
+        if kind == PluginKind::Source {
+            super::require_source_drain_protocol(&module, &plugin_type)?;
+        }
         let (Some(describe), Some(_)) =
             (module.describe_partitioned(), module.create_partitioned())
         else {

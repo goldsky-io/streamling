@@ -952,6 +952,7 @@ fn generate_init_plugin_code(use_direct_tokio: bool) -> TokenStream {
                 set_shutdown_signal,
                 describe_partitioned,
                 create_partitioned,
+                source_drain_protocol: streamling_plugin::source_drain_protocol,
             }
             .leak_into_prefix()
         }

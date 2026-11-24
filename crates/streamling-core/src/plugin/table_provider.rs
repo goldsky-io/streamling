@@ -1,3 +1,4 @@
+use crate::checkpoints::checkpoint_management::CheckpointControl;
 use crate::checkpoints::checkpoint_management::{
     CHECKPOINT_COORDINATOR_CHANNEL, CheckpointEpoch, CheckpointMessage,
     enrich_batch_metadata_with_checkpoints, extract_checkpoint_messages, now_ms,
@@ -91,6 +92,7 @@ struct PluginSourceExec {
     internal_buffer_size: u32,
     metric_metadata_id: String,
     scope: Arc<crate::shutdown::ComponentScope>,
+    checkpoint_control: Option<CheckpointControl>,
 }
 
 impl PluginSourceExec {
@@ -101,6 +103,7 @@ impl PluginSourceExec {
         internal_buffer_size: u32,
         metric_metadata_id: String,
         scope: Arc<crate::shutdown::ComponentScope>,
+        checkpoint_control: Option<CheckpointControl>,
     ) -> Self {
         let cached_properties = Self::compute_properties(schema.clone(), instances.len());
         Self {
@@ -111,6 +114,7 @@ impl PluginSourceExec {
             internal_buffer_size,
             metric_metadata_id,
             scope,
+            checkpoint_control,
         }
     }
 
@@ -197,6 +201,7 @@ impl ExecutionPlan for PluginSourceExec {
         let forwarder_scope = self.scope.clone();
         let projection = self.projection.clone();
         let schema_for_flush = self.schema.clone();
+        let checkpoint_control = self.checkpoint_control.clone();
 
         builder.spawn(async move {
             // PostPlugin-stage scope: exits on channel disconnect at plugin
@@ -217,38 +222,16 @@ impl ExecutionPlan for PluginSourceExec {
             let mut batch_count: u64 = 0;
             let mut batches_with_markers: u64 = 0;
             let mut batches_without_markers: u64 = 0;
-
-            // Observe the process-wide shutdown signal so a plugin source stops
-            // producing and ends its stream (front-to-back drain), instead of
-            // emitting until the watchdog hard-exits. The plugin process itself
-            // keeps running until the run loop sends Terminate AFTER the sinks
-            // drain — here we only stop forwarding: drain the messages the
-            // plugin had already emitted at signal time (a snapshot, so a
-            // still-producing plugin cannot pin the drain), then end the
-            // stream so downstream sinks see stream-end and flush.
-            let shutdown_rx = crate::shutdown::subscribe();
-            // Some(n) once shutdown was observed: at most n more messages are
-            // forwarded before the stream ends.
-            let mut drain_remaining: Option<usize> = None;
-
+            let mut pending_control = None;
+            let mut terminal_epoch = None;
+            let mut terminal_marker_pending = None;
+            let mut terminal_finalizer_sent = false;
+            let mut data_complete = false;
+            let mut outstanding_controls = 0usize;
             'outer: loop {
                 loop {
                     let dispatcher_exited = instance_exit.has_exited();
-                    if drain_remaining.is_none() && *shutdown_rx.borrow() {
-                        let in_flight = plugin_output_receiver.len();
-                        info!(
-                            "PluginSourceExec: shutdown requested; draining {} in-flight plugin message(s), then ending stream",
-                            in_flight
-                        );
-                        drain_remaining = Some(in_flight);
-                    }
-                    if drain_remaining == Some(0) {
-                        break 'outer;
-                    }
                     if !plugin_output_receiver.is_empty() {
-                        if let Some(n) = drain_remaining.as_mut() {
-                            *n -= 1;
-                        }
                         if let Ok(message) = plugin_output_receiver.recv() {
                             match message.into_enum() {
                                 Ok(PluginMsg::NextBatch { data }) => {
@@ -313,6 +296,7 @@ impl ExecutionPlan for PluginSourceExec {
                                     }
                                 }
                                 Ok(PluginMsg::CheckpointMarker { epoch }) => {
+                                    outstanding_controls = outstanding_controls.saturating_sub(1);
                                     debug!(
                                         "Buffering checkpoint marker with epoch {} from plugin",
                                         epoch.0,
@@ -327,6 +311,7 @@ impl ExecutionPlan for PluginSourceExec {
                                     });
                                 }
                                 Ok(PluginMsg::CheckpointFinalizer { epoch }) => {
+                                    outstanding_controls = outstanding_controls.saturating_sub(1);
                                     debug!(
                                         "Buffering checkpoint finalizer with epoch {} from plugin",
                                         epoch.0
@@ -334,22 +319,33 @@ impl ExecutionPlan for PluginSourceExec {
                                     checkpoint_buffer.push(CheckpointMessage::Finalizer(
                                         CheckpointEpoch(epoch.0),
                                     ));
+                                    if terminal_finalizer_sent && terminal_epoch == Some(epoch.0) {
+                                        // The hook persisted acknowledged state before
+                                        // emitting this echo. No controls were sent
+                                        // behind it, so output cannot refill after EOF.
+                                        break 'outer;
+                                    }
                                 }
                                 Ok(PluginMsg::Terminate) => {
-                                    // Output-direction Terminate: the plugin
-                                    // source stopped on its own (bounded work
-                                    // complete) — see the variant's doc on
-                                    // `PluginMsg` for the reuse rationale. End
-                                    // the stream so downstream sinks see
-                                    // end-of-stream and a job-mode pipeline
-                                    // can finish; the flush after the loop
-                                    // carries any still-buffered markers to
-                                    // the sinks. Ends this partition only.
-                                    info!(
-                                        "PluginSourceExec: source {} reported completion; ending its record-batch stream",
-                                        plugin_label
-                                    );
-                                    break 'outer;
+                                    // All data preceding this boundary has reached
+                                    // downstream. Keep the stream open for the
+                                    // terminal marker: sinks flush and ack markers
+                                    // without requiring EOF.
+                                    data_complete = true;
+                                    if let Some(control) = &checkpoint_control {
+                                        let epoch = control.begin_terminal_checkpoint();
+                                        terminal_epoch = Some(epoch.0);
+                                        terminal_marker_pending = Some(NonExhaustive::new(
+                                            PluginMsg::CheckpointMarker {
+                                                epoch: PluginCheckpointEpoch(epoch.0),
+                                            },
+                                        ));
+                                        info!("PluginSourceExec: source {} completed data; checkpointing terminal epoch {}", plugin_label, epoch.0);
+                                    } else {
+                                        // Fast mode leaves unsent controls uncommitted,
+                                        // but consumes every already-sent control echo.
+                                        pending_control = None;
+                                    }
                                 }
                                 Ok(PluginMsg::Error { message }) => {
                                     // Buffered markers are dropped with the
@@ -370,8 +366,16 @@ impl ExecutionPlan for PluginSourceExec {
                                 _ => {}
                             }
                         }
+                        if data_complete && checkpoint_control.is_none() && outstanding_controls == 0 {
+                            break 'outer;
+                        }
 
-                        if checkpoint_receiver.is_empty() {
+                        if terminal_finalizer_sent
+                            || (data_complete && checkpoint_control.is_none())
+                            || (checkpoint_receiver.is_empty()
+                                && pending_control.is_none()
+                                && terminal_marker_pending.is_none())
+                        {
                             continue;
                         } else {
                             break;
@@ -420,7 +424,12 @@ impl ExecutionPlan for PluginSourceExec {
                             )
                             .await;
                         }
-                        if !checkpoint_receiver.is_empty() {
+                        if !(terminal_finalizer_sent
+                            || data_complete && checkpoint_control.is_none())
+                            && (!checkpoint_receiver.is_empty()
+                                || pending_control.is_some()
+                                || terminal_marker_pending.is_some())
+                        {
                             break;
                         }
                         // Sleep, don't yield: yield_now in this idle arm
@@ -430,42 +439,33 @@ impl ExecutionPlan for PluginSourceExec {
                     }
                 }
 
-                if !checkpoint_receiver.is_empty() {
+                if pending_control.is_none() {
+                    pending_control = terminal_marker_pending.take();
+                }
+                if !terminal_finalizer_sent && pending_control.is_none() && !checkpoint_receiver.is_empty() {
                     match checkpoint_receiver.recv() {
                         Ok(CheckpointMessage::Marker {
                             epoch,
                             created_at_ms,
-                        }) => {
+                        }) if terminal_epoch.is_none() => {
                             // Store created_at_ms for this epoch
                             epoch_created_at.insert(epoch.0, created_at_ms);
                             debug!(
                                 "PluginSourceExec: Received checkpoint Marker epoch {} from coordinator, forwarding to plugin (batch_count={}, pending_buffer={})",
                                 epoch.0, batch_count, checkpoint_buffer.len()
                             );
-                            crate::plugin::send_to_plugin(
-                                &plugin_input_sender,
-                                NonExhaustive::new(PluginMsg::CheckpointMarker {
-                                    epoch: PluginCheckpointEpoch(epoch.0),
-                                }),
-                                &plugin_label,
-                                &instance_exit,
-                            )
-                            .await?;
+                            pending_control = Some(NonExhaustive::new(PluginMsg::CheckpointMarker {
+                                epoch: PluginCheckpointEpoch(epoch.0),
+                            }));
                         }
                         Ok(CheckpointMessage::Finalizer(epoch)) => {
                             debug!(
                                 "Propagating checkpoint Finalizer with epoch {} to plugin",
                                 epoch.0
                             );
-                            crate::plugin::send_to_plugin(
-                                &plugin_input_sender,
-                                NonExhaustive::new(PluginMsg::CheckpointFinalizer {
-                                    epoch: PluginCheckpointEpoch(epoch.0),
-                                }),
-                                &plugin_label,
-                                &instance_exit,
-                            )
-                            .await?;
+                            pending_control = Some(NonExhaustive::new(PluginMsg::CheckpointFinalizer {
+                                epoch: PluginCheckpointEpoch(epoch.0),
+                            }));
                         }
                         Ok(_) => {
                             // ignore other messages
@@ -475,24 +475,25 @@ impl ExecutionPlan for PluginSourceExec {
                         }
                     }
                 }
-            }
-
-            // Shutdown drain complete. Coordinator messages still queued on
-            // our subscription never made the plugin round-trip (e.g. the
-            // terminal epoch's Marker, broadcast during the shutdown window).
-            // The plugin is about to be terminated, so forwarding them to it
-            // is pointless — but the SINKS still need to see the Marker for
-            // the epoch to collect acks and finalize. Fold them into the
-            // synthetic-final-batch flush below.
-            while let Ok(message) = checkpoint_receiver.try_recv() {
-                if let m @ (CheckpointMessage::Marker { .. } | CheckpointMessage::Finalizer(_)) =
-                    message
-                {
-                    debug!(
-                        "PluginSourceExec: attaching still-queued coordinator message to final flush: {:?}",
-                        m
+                if let Some(message) = pending_control.take() {
+                    let terminal_finalizer = matches!(
+                        message.as_enum(),
+                        Ok(PluginMsg::CheckpointFinalizer { epoch }) if terminal_epoch == Some(epoch.0)
                     );
-                    checkpoint_buffer.push(m);
+                    match plugin_input_sender.try_send(message) {
+                        Ok(()) => {
+                            outstanding_controls += 1;
+                            terminal_finalizer_sent |= terminal_finalizer;
+                        }
+                        Err(crossbeam::channel::TrySendError::Full(message)) => {
+                            pending_control = Some(message);
+                            tokio::time::sleep(super::IDLE_POLL_INTERVAL).await;
+                        }
+                        Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                            unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
+                            return Err(crate::plugin::plugin_exited(&plugin_label));
+                        }
+                    }
                 }
             }
 
@@ -509,8 +510,6 @@ impl ExecutionPlan for PluginSourceExec {
                 flush_checkpoint_buffer_on_empty_batch(&tx, &schema_for_flush, &mut checkpoint_buffer)
                     .await;
             }
-            // Drop our coordinator subscription cleanly so later broadcasts
-            // don't hit a dead sender.
             unsubscribe(CHECKPOINT_COORDINATOR_CHANNEL, checkpoint_subscriber_id);
             Ok(())
         });
@@ -530,6 +529,8 @@ pub struct PluginSourceProvider {
     /// dispatcher drain (it serves the dispatcher's flush), so it drains
     /// between the dispatcher drain and coordinator stop.
     scope: Arc<crate::shutdown::ComponentScope>,
+    /// None selects explicit fast mode: drain data and leave the tail replayable.
+    checkpoint_control: Option<CheckpointControl>,
 }
 
 impl PluginSourceProvider {
@@ -539,6 +540,7 @@ impl PluginSourceProvider {
         internal_buffer_size: u32,
         metric_metadata_id: String,
         scope: Arc<crate::shutdown::ComponentScope>,
+        checkpoint_control: Option<CheckpointControl>,
     ) -> Self {
         Self {
             schema,
@@ -546,6 +548,7 @@ impl PluginSourceProvider {
             internal_buffer_size,
             metric_metadata_id,
             scope,
+            checkpoint_control,
         }
     }
 
@@ -570,6 +573,7 @@ impl PluginSourceProvider {
             self.internal_buffer_size,
             self.metric_metadata_id.clone(),
             self.scope.clone(),
+            self.checkpoint_control.clone(),
         )))
     }
 }
@@ -1087,6 +1091,239 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn source_drain_persists_terminal_before_eof() {
+        source_completion_roundtrip(true).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn source_fast_drain_consumes_pending_control_echoes() {
+        source_completion_roundtrip(false).await;
+    }
+
+    #[allow(clippy::disallowed_methods)] // Synchronous fixture plugin and test teardown.
+    async fn source_completion_roundtrip(terminal: bool) {
+        let channels = Arc::new(PluginChannels {
+            input: PluginChannel::new(ffi_channel::bounded(1)),
+            output: PluginChannel::new(ffi_channel::bounded(1)),
+            metrics: PluginMetricsChannel::new(ffi_channel::bounded(1)),
+        });
+        let persisted = Arc::new(AtomicU64::new(0));
+        let plugin_channels = channels.clone();
+        let plugin_persisted = persisted.clone();
+        let plugin = std::thread::spawn(move || {
+            assert!(matches!(
+                plugin_channels
+                    .input
+                    .receiver
+                    .recv()
+                    .unwrap()
+                    .into_enum()
+                    .unwrap(),
+                PluginMsg::Init
+            ));
+            // Capacity one forces the host to consume every message before
+            // completion can be enqueued. No queue-length snapshot is safe.
+            plugin_channels
+                .output
+                .sender
+                .send(NonExhaustive::new(PluginMsg::NextBatch {
+                    data: batch(&[11, 12], &[]).into(),
+                }))
+                .unwrap();
+            let pending = if terminal {
+                None
+            } else {
+                let message = plugin_channels.input.receiver.recv().unwrap();
+                assert!(matches!(
+                    message.as_enum(),
+                    Ok(PluginMsg::CheckpointMarker { .. })
+                ));
+                Some(message)
+            };
+            plugin_channels
+                .output
+                .sender
+                .send(NonExhaustive::new(PluginMsg::Terminate))
+                .unwrap();
+            if let Some(message) = pending {
+                plugin_channels.output.sender.send(message).unwrap();
+            }
+            loop {
+                match plugin_channels
+                    .input
+                    .receiver
+                    .recv()
+                    .unwrap()
+                    .into_enum()
+                    .unwrap()
+                {
+                    PluginMsg::CheckpointMarker { epoch } => {
+                        plugin_channels
+                            .output
+                            .sender
+                            .send(NonExhaustive::new(PluginMsg::CheckpointMarker { epoch }))
+                            .unwrap();
+                    }
+                    PluginMsg::CheckpointFinalizer { epoch } => {
+                        plugin_persisted.store(epoch.0, Ordering::SeqCst);
+                        plugin_channels
+                            .output
+                            .sender
+                            .send(NonExhaustive::new(PluginMsg::CheckpointFinalizer { epoch }))
+                            .unwrap();
+                    }
+                    PluginMsg::Terminate => break,
+                    other => panic!("unexpected host control: {other:?}"),
+                }
+            }
+        });
+        let controller = crate::shutdown::ShutdownController::new(Duration::from_secs(5));
+        let (_execution, exit) = crate::plugin::track_exit(Box::pin(std::future::pending()));
+        let exec = PluginSourceExec::new(
+            source_schema(),
+            None,
+            vec![PluginInstance {
+                key: "draining-source".into(),
+                channels: channels.clone(),
+                exit,
+            }],
+            1,
+            "app::draining-source".into(),
+            controller.scope_at("metrics", crate::shutdown::DrainStage::PostPlugin),
+            terminal.then(|| {
+                crate::checkpoints::checkpoint_management::CheckpointCoordinator::new().control()
+            }),
+        );
+        let mut stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        if !terminal {
+            send(CHECKPOINT_COORDINATOR_CHANNEL, marker(90010)).unwrap();
+        }
+        let mut rows = Vec::new();
+        let mut finalized = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                rows.extend(ids(&batch));
+                for epoch in marker_epochs(&batch) {
+                    assert_eq!(rows, vec![11, 12], "marker must follow all covered data");
+                    if terminal {
+                        assert_eq!(persisted.load(Ordering::SeqCst), 0);
+                        send(
+                            CHECKPOINT_COORDINATOR_CHANNEL,
+                            CheckpointMessage::Finalizer(CheckpointEpoch(epoch)),
+                        )
+                        .unwrap();
+                        finalized = epoch;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("source must consume through its data boundary");
+        assert_eq!(rows, vec![11, 12]);
+        assert_eq!(persisted.load(Ordering::SeqCst), finalized);
+        assert_eq!(finalized > 0, terminal);
+        assert!(
+            channels.output.receiver.is_empty(),
+            "finalizer must roundtrip before Terminate"
+        );
+        channels
+            .input
+            .sender
+            .send(NonExhaustive::new(PluginMsg::Terminate))
+            .unwrap();
+        plugin.join().unwrap();
+        controller
+            .drain(crate::shutdown::DrainStage::PostPlugin, None)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn source_drain_multiple_sources_and_partitions_finalize_without_eof() {
+        let mut coordinator =
+            crate::checkpoints::checkpoint_management::CheckpointCoordinator::new();
+        let control = coordinator.control();
+        coordinator.start(3600, vec!["terminal-a".into(), "terminal-b".into()]);
+        let sources = [
+            describe(
+                "terminal-a",
+                SOURCE,
+                PluginKind::Source,
+                &[(ROWS, "25"), (PREFERRED, "2")],
+            ),
+            describe(
+                "terminal-b",
+                SOURCE,
+                PluginKind::Source,
+                &[(ROWS, "7"), (PREFERRED, "1")],
+            ),
+        ];
+        let mut streams = Vec::new();
+        for (node, source) in ["terminal-a", "terminal-b"].into_iter().zip(&sources) {
+            let plan = PluginSourceProvider::new(
+                source_schema(),
+                PluginInstances::Partitioned(source.clone()),
+                1,
+                format!("app::{node}"),
+                crate::shutdown::ComponentScope::detached("metrics"),
+                Some(control.clone()),
+            )
+            .scan(&SessionContext::new().state(), None, &[], None)
+            .await
+            .unwrap();
+            let width = plan.output_partitioning().partition_count();
+            let markers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for partition in 0..width {
+                let mut stream = plan
+                    .execute(partition, Arc::new(TaskContext::default()))
+                    .unwrap();
+                let markers = markers.clone();
+                streams.push(async move {
+                    let mut rows = 0;
+                    let mut terminal = None;
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch.unwrap();
+                        rows += batch.num_rows();
+                        for epoch in marker_epochs(&batch) {
+                            assert!(
+                                terminal.replace(epoch).is_none(),
+                                "one terminal marker per partition"
+                            );
+                            // A sink acknowledges only after every source
+                            // partition has delivered its marker, before EOF.
+                            if markers.fetch_add(1, Ordering::SeqCst) + 1 == width {
+                                send(
+                                    CHECKPOINT_COORDINATOR_CHANNEL,
+                                    CheckpointMessage::Ack {
+                                        epoch: CheckpointEpoch(epoch),
+                                        sink_id: node.into(),
+                                    },
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                    (rows, terminal.expect("terminal marker must precede EOF"))
+                });
+            }
+        }
+        let delivered = tokio::time::timeout(EXIT_BOUND, futures::future::join_all(streams))
+            .await
+            .expect("sinks must ack terminal markers without source EOF");
+        assert_eq!(delivered.iter().map(|(rows, _)| rows).sum::<usize>(), 57);
+        assert!(delivered.iter().all(|(_, epoch)| *epoch == delivered[0].1));
+        for source in sources {
+            for (key, exit) in shut_down(&source).await {
+                assert!(exit.is_ok(), "{key}: {exit:?}");
+            }
+        }
+        coordinator.stop().await;
+    }
+
     /// Regression: in job mode the terminal checkpoint marker rides the LAST
     /// batch, so the plugin's `CheckpointAck` lands on the output channel only
     /// after `write_all`'s batch loop has already parked on the exhausted
@@ -1230,6 +1467,7 @@ mod tests {
             10,
             format!("app::{node}"),
             crate::shutdown::ComponentScope::detached("test"),
+            None,
         )
         .scan(&SessionContext::new().state(), None, &[], None)
         .await
@@ -1363,8 +1601,19 @@ mod tests {
         }
         shut_down(&source).await;
         for stream in streams {
-            let rest: Vec<RecordBatch> = stream.map(|b| b.unwrap()).collect().await;
-            assert!(rest.iter().all(|b| !marker_epochs(b).contains(&EPOCH)));
+            // This test sends input Terminate while the source is still
+            // producing, rather than requesting a data-boundary drain.
+            let rest: Vec<_> = stream.collect().await;
+            assert!(
+                rest.iter()
+                    .filter_map(|batch| batch.as_ref().ok())
+                    .all(|batch| !marker_epochs(batch).contains(&EPOCH))
+            );
+            assert!(rest.iter().any(|batch| {
+                batch
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("dispatcher exited"))
+            }));
         }
     }
 

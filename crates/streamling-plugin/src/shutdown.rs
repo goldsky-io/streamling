@@ -11,15 +11,13 @@
 //!
 //! # The one rule
 //!
-//! **Read the signal inside hooks; never use it as a loop condition.** The
-//! dispatcher's message loop exits on `is_running()`, which is safe precisely
-//! because that flag flips only when `Terminate` is dequeued — with nothing
-//! queued behind it. Wiring this signal into a loop guard lets the dispatcher
-//! exit while a `CheckpointMarker` is still queued: the terminal marker is
-//! abandoned, no ack is sent, offsets never commit, and the tail replays.
-//! The retry helpers below consume the signal internally so there is no bare
-//! boolean to reach for; [`is_shutting_down`] exists as an escape hatch for
-//! checks *between units of work inside a hook*, nothing else.
+//! **Quiesce source generation, never abandon queued control messages.**
+//! A source dispatcher observes this signal between completed batch sends,
+//! emits its end-of-data boundary, then keeps consuming finalizers until
+//! input `Terminate`. Sink and transform dispatchers exit only on input
+//! `Terminate`; using the signal as their loop guard could abandon a queued
+//! checkpoint marker and its durable flush.
+//! The retry helpers below consume the signal internally.
 //!
 //! # Absence is normal
 //!
@@ -143,8 +141,8 @@ pub fn install_shutdown_signal(signal: ShutdownSignalObj) {
 }
 
 /// Whether graceful shutdown has been requested. `false` when no signal is
-/// installed. For checks between units of work inside a hook — never as a
-/// dispatcher/loop exit condition (see the module docs for why).
+/// installed. Source dispatchers use this to quiesce generation at a batch
+/// boundary, not to exit their control loop.
 pub fn is_shutting_down() -> bool {
     CELL.is_shutting_down()
 }

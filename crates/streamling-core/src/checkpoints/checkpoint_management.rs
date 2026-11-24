@@ -378,7 +378,7 @@ pub struct CheckpointCoordinator {
 /// control-plane signals, so they are handle methods rather than
 /// `CheckpointMessage` variants: the on-the-wire protocol stays limited to
 /// data-plane markers, acks, and finalizers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CheckpointControl {
     epochs: Arc<Mutex<BTreeMap<CheckpointEpoch, EpochState>>>,
     expected_sinks: Arc<Mutex<HashSet<String>>>,

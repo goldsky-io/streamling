@@ -541,12 +541,12 @@ pub enum PluginMsg {
     },
     /// Host → plugin (input channel): stop and clean up.
     ///
-    /// Plugin → host (a SOURCE dispatcher's OUTPUT channel): the source
-    /// stopped on its own (bounded work complete) — the host ends the
-    /// source's record-batch stream on receipt so downstream sinks see
-    /// end-of-stream and a job-mode pipeline can finish. Without the signal,
-    /// a self-terminating plugin source leaves its stream open forever. The
-    /// reverse direction reuses this existing variant ON PURPOSE: adding a
+    /// Plugin -> host (a SOURCE dispatcher's OUTPUT channel): no more data
+    /// batches will be emitted, either because bounded work completed or
+    /// because the installed shutdown signal requested a drain. The host
+    /// consumes all preceding output before ending the record-batch stream.
+    /// The dispatcher remains alive for finalizers until input Terminate.
+    /// The reverse direction reuses this existing variant: adding a
     /// new variant is rejected by abi_stable's layout check when the host
     /// expects more variants than an older library carries (the same
     /// asymmetry as prefix fields), which would break loading every existing
