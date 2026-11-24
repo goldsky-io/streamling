@@ -166,6 +166,26 @@ async fn snapshot(ctx: &TestContext, nodes: &[&'static str]) -> Snapshot {
         )
         .await
         .expect("no node_wait series exported for this run");
+    // Presence is already true from a mid-run push. The process has exited, so
+    // the total stops growing once the final push is ingested.
+    let total = format!(
+        "sum(streamling_node_wait_milliseconds_total{{instance=\"{}\"}})",
+        ctx.test_id
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = ms(ctx, total.clone()).await;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let now = ms(ctx, total.clone()).await;
+        if now == last {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node_wait total still changing after 30s: {last} -> {now}"
+        );
+        last = now;
+    }
     let id = Some(ctx.test_id.as_str());
     let mut snapshot = Snapshot::default();
     for &node in nodes {
