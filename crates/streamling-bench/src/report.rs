@@ -80,12 +80,17 @@ pub fn compare(current: &BenchResult, baseline: &BenchResult, threshold: f64) ->
 /// empty when there is no baseline (or when seeding one).
 pub fn print_report(result: &BenchResult, comparison: &[MetricDelta]) {
     println!("\n### {} ({})", result.scenario, result.format);
+    let worker_threads = result
+        .tokio_worker_threads
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "runtime-default".to_string());
     println!(
-        "records={} payload={}B selectivity={} iterations={} runner={} version={}",
+        "records={} payload={}B selectivity={} iterations={} tokio_workers={} runner={} version={}",
         result.records,
         result.payload_bytes,
         result.selectivity,
         result.iterations,
+        worker_threads,
         result.runner_label,
         result.version,
     );
