@@ -2432,6 +2432,30 @@ Streamling exports two variants of the `output_rows` metric with different tempo
 
 - **`output_rows_delta`** (Delta): Reports incremental rows since the last export interval. Use this for billing and aggregation use cases in time-series databases like ClickHouse, where you can simply `SUM()` the values without worrying about resets or lag compensation.
 
+`input_rows` has the same pair: **`input_rows_total`** (Cumulative) and **`input_rows_delta`** (Delta). Both count the rows entering a node:
+
+- Source: the rows the source pulls in, before its `filter:`. A ClickHouse source pushes its filter into the query, so it counts only the rows ClickHouse returns, before the source deduplicates them by version. A Parquet file source skips the row groups that a pushed-down filter rules out, so it does not count their rows. A hybrid source counts the rows of its bounded and unbounded phases on the hybrid node itself.
+- Transform: the `output_rows` of its upstream nodes, which is what it receives.
+- Sink: the rows it receives, before primary-key deduplication.
+
+A source's `output_rows` counts the rows it emits after its `filter:`, so `input_rows` minus `output_rows` is what the filter dropped.
+
+Filter on `topology_node_type` when you sum them, because a row counts once on every node it enters.
+
+Byte metrics (Delta):
+
+- **`input_bytes_delta`** on sources: the bytes the source reads, whatever columns the pipeline selects and whatever its `filter:`:
+  - Kafka: the payload bytes of each consumed message.
+  - ClickHouse: the HTTP response body of each emitted page; a page re-read after an overflow counts once.
+  - File: each file's full size when the source opens it, even when Parquet row-group pruning or a record limit reads less of it. A file re-read after a stop or restart counts again, as its rows do.
+  - Plugin: the Arrow size of the plugin's batches (see below), because a plugin exposes no wire bytes.
+  - Hybrid: its Kafka and ClickHouse phases report on the hybrid node itself.
+- **`output_bytes_delta`** on sinks: the Arrow size of the rows each sink wrote, after primary-key deduplication.
+
+A sink counts `output_rows` and `output_bytes_delta` only after the destination confirms the write: a committed ClickHouse or Postgres write, an HTTP delivery, a Kafka broker ack (`acks=all`), or a plugin's successful `process_batch`. When only part of a batch lands (skipped HTTP deliveries, failed Kafka messages), the sink counts the delivered rows and the same share of the batch's bytes.
+
+An Arrow size is the size the rows would have if copied into fresh Arrow arrays of the same types. A slice counts only its own rows at every nesting level. Dictionary and run-end encoded columns count their decoded values.
+
 ### Adding Telemetry to Custom Operators
 
 #### For Execution Plans (Sources and Transforms)

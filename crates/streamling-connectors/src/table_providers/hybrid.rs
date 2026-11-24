@@ -120,7 +120,7 @@ pub struct HybridSourceState {
 /// State Transitions:
 /// - INITIAL -> BOUNDED[0]: Automatic on creation
 /// - BOUNDED[i] -> BOUNDED[i+1]: When bounded source stream ends
-/// - BOUNDED[N] -> UNBOUNDED: When last bounded source stream ends (optionally fetches offsets via offset_provider)
+/// - BOUNDED[N] -> UNBOUNDED: When last bounded source stream ends (seeds the offsets snapshotted via offset_provider before BOUNDED[N] started)
 /// - UNBOUNDED -> FINISHED: When unbounded stream ends (typically runs indefinitely)
 #[derive(Clone, Debug)]
 pub struct HybridSourceConfig {
@@ -275,6 +275,8 @@ impl HybridTableProvider {
         let mut bounded_table_providers = Vec::new();
 
         let application_id = app_config.application_id.clone();
+        // Both phases count the rows they pull in as the hybrid node's input.
+        let input_rows_id = Some(metric_key(&application_id, &reference_name));
 
         let unbounded_source_topic = unbounded_source.topic.clone();
         let unbounded_table_provider: Arc<dyn TableProvider> =
@@ -319,12 +321,15 @@ impl HybridTableProvider {
                         })?
                         .with_scope(scope.clone()),
                     );
-                    Arc::new(WrappingSourceTableProvider::new(
-                        kafka_table_provider,
-                        metric_key_hybrid_src_unbounded(&application_id, reference_name.as_str()),
-                        None,
-                        telemetry,
-                    ))
+                    Arc::new(
+                        WrappingSourceTableProvider::new(
+                            kafka_table_provider,
+                            metric_key_hybrid_src_unbounded(&application_id, &reference_name),
+                            None,
+                            telemetry,
+                        )
+                        .with_input_rows_id(input_rows_id.clone()),
+                    )
                 }
                 _ => {
                     return Err(streamling_core::streamling_user_err!(
@@ -383,16 +388,20 @@ impl HybridTableProvider {
                         clickhouse_provider.schema()
                     );
 
-                    let provider_with_telemetry = Arc::new(WrappingSourceTableProvider::new(
-                        clickhouse_provider,
-                        metric_key_hybrid_src_bounded(
-                            &application_id,
-                            reference_name.as_str(),
-                            idx,
-                        ),
-                        None, // We shouldn't need it here since the whole thing is nested under one wrapping provider.
-                        telemetry,
-                    ));
+                    let provider_with_telemetry = Arc::new(
+                        WrappingSourceTableProvider::new(
+                            clickhouse_provider,
+                            metric_key_hybrid_src_bounded(
+                                &application_id,
+                                reference_name.as_str(),
+                                idx,
+                            ),
+                            None, // We shouldn't need it here since the whole thing is nested under one wrapping provider.
+                            telemetry,
+                        )
+                        // The ClickHouse exec counts its input rows on the hybrid node itself.
+                        .with_input_rows_id(None),
+                    );
                     bounded_table_providers.push(provider_with_telemetry as Arc<dyn TableProvider>);
                 }
                 _ => {
@@ -565,6 +574,8 @@ impl HybridTableProvider {
         }
 
         match (bounded_type, unbounded_type) {
+            (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+            | (DataType::Binary | DataType::LargeBinary, DataType::BinaryView) => true,
             // Nested field names can differ (for example "item" vs "element"):
             // Arrow/DataFusion producers label list children differently even
             // when the list semantics are identical.
@@ -662,7 +673,7 @@ impl HybridTableProvider {
         // expensive `offset_provider.get_offsets()` call would only be used
         // to confirm a foregone "fall through". Skipping it here means cold
         // starts incur one ClickHouse offset query (the one in
-        // `advance_to_next_phase`), not two.
+        // `snapshot_unbounded_offsets`), not two.
         let kafka_has_any_state = match kafka_provider {
             Some(kp) => kp.has_any_persisted_offset().await,
             None => false,
@@ -854,6 +865,45 @@ impl HybridTableProvider {
         Ok(wrapping_table_provider.get_inner())
     }
 
+    /// Record the offset provider's position before the final bounded phase
+    /// starts scanning, for `advance_to_next_phase` to seed the unbounded
+    /// source from.
+    ///
+    /// The bounded scan fixes its upper bound when it starts, while the
+    /// archive keeps ingesting from the unbounded topic. A position read at
+    /// the handoff is ahead of that bound, and the rows in between would be
+    /// read by neither phase. A position read before the scan starts is at or
+    /// behind the bound; the unbounded phase re-reads the overlap.
+    ///
+    /// A persisted snapshot is kept across restarts: the resumed scan's bound
+    /// can only be higher than the one the snapshot was taken for.
+    ///
+    /// Job mode never runs the unbounded phase, so it takes no snapshot.
+    pub async fn snapshot_unbounded_offsets(&self) -> DataFusionResult<()> {
+        let Some(offset_provider) = &self.config.offset_provider else {
+            return Ok(());
+        };
+        if self.config.job_mode {
+            return Ok(());
+        }
+
+        let mut state = self.state.write().await;
+        if state.current_phase + 1 != self.config.bounded_sources.len()
+            || state.unbounded_offsets.is_some()
+        {
+            return Ok(());
+        }
+
+        let offsets = offset_provider.get_offsets().await?;
+        info!(
+            "Hybrid source '{}': unbounded offset snapshot before bounded phase {}: {:?}",
+            self.reference_name, state.current_phase, offsets
+        );
+        state.unbounded_offsets = Some(offsets);
+        drop(state);
+        self.save_state().await
+    }
+
     pub async fn advance_to_next_phase(&self) -> DataFusionResult<()> {
         let mut state = self.state.write().await;
         let from_phase = state.current_phase;
@@ -871,20 +921,17 @@ impl HybridTableProvider {
 
         if state.current_phase == self.config.bounded_sources.len()
             && !self.config.job_mode
-            && let Some(offset_provider) = &self.config.offset_provider
+            && self.config.offset_provider.is_some()
         {
-            // Only fetch/seed offsets when actually transitioning to the
-            // unbounded phase. In job_mode the unbounded phase never runs, so
-            // this ClickHouse max-offset query + Kafka seed is wasted work and a
-            // stall/hang vector under load (it blocks advance_to_next_phase,
-            // which the hybrid execute loop must return from before it can break
-            // and end the source stream). Skip it; the bounded source's own
-            // cursor is already persisted via its checkpoint Finalizer.
-            let offsets = offset_provider.get_offsets().await?;
-            state.unbounded_offsets = Some(offsets.clone());
+            let offsets = state.unbounded_offsets.clone().ok_or_else(|| {
+                streamling_err!(
+                    "hybrid source '{}': no unbounded offset snapshot at the handoff",
+                    self.reference_name
+                )
+            })?;
 
-            // Seed the Kafka source's state backend with the offsets from ClickHouse
-            // so that the Kafka consumer will start from the correct position
+            // Seed the Kafka source's state backend so the consumer starts
+            // from the snapshot position.
             if let Some(wrapping_provider) = self
                 .config
                 .unbounded_source
@@ -1253,6 +1300,11 @@ impl ExecutionPlan for HybridSourceExec {
                         break 'outer;
                     }
                 };
+
+                if let Err(e) = provider.snapshot_unbounded_offsets().await {
+                    let _ = tx.send(Err(e)).await;
+                    break 'outer;
+                }
 
                 let stream_result = provider
                     .get_current_execution_stream(
@@ -2195,6 +2247,152 @@ mod tests {
     }
 
     #[test]
+    fn string_and_binary_bounded_types_back_view_unbounded_types() {
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeUtf8,
+            &DataType::Utf8View
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::Binary,
+            &DataType::BinaryView
+        ));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &DataType::LargeBinary,
+            &DataType::BinaryView
+        ));
+        // Nested view target under a list is also compatible.
+        let bounded_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let unbounded_list =
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true)));
+        assert!(HybridTableProvider::is_compatible_data_type(
+            &bounded_list,
+            &unbounded_list
+        ));
+        // Reverse direction is not implicitly widened.
+        assert!(!HybridTableProvider::is_compatible_data_type(
+            &DataType::Utf8View,
+            &DataType::Utf8
+        ));
+    }
+
+    #[test]
+    fn hybrid_bounded_batch_normalizes_string_and_binary_to_view() {
+        use arrow::array::{
+            Array, AsArray, BinaryArray, FixedSizeListArray, Int64Array, LargeStringArray,
+            ListBuilder, StringArray, StringBuilder,
+        };
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder
+            .values()
+            .append_value("long_nested_topic_value");
+        list_builder.append(true);
+        list_builder.append_null();
+
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            Arc::new(StringArray::from(vec![
+                Some("fixed_slot_0_long"),
+                Some("fixed_slot_1_long"),
+                None,
+                None,
+            ])),
+            None,
+        )
+        .unwrap();
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("raw", DataType::Binary, true),
+            Field::new("input", DataType::LargeUtf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 2),
+                true,
+            ),
+            Field::new("extra", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"0123456789abcdef".as_slice()),
+                    None,
+                ])),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("0x1234567890abcdef1234567890abcdef"),
+                    None,
+                ])),
+                Arc::new(list_builder.finish()),
+                Arc::new(fsl),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("input", DataType::Utf8View, true),
+            Field::new("raw", DataType::BinaryView, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8View, true))),
+                true,
+            ),
+            Field::new(
+                "pair",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("element", DataType::Utf8View, true)),
+                    2,
+                ),
+                true,
+            ),
+        ]));
+
+        // Exercises the exact two-step path HybridSourceExec runs on every batch.
+        let aligned = align_batch_to_schema(&batch, &target_schema).unwrap();
+        let normalized =
+            ClickHouseClient::normalize_batch_from_clickhouse(&aligned, &target_schema).unwrap();
+
+        assert_eq!(normalized.schema(), target_schema);
+        assert_eq!(
+            normalized.column(0).as_string_view().value(0),
+            "0x1234567890abcdef1234567890abcdef"
+        );
+        assert!(normalized.column(0).is_null(1));
+        assert_eq!(
+            normalized.column(1).as_binary_view().value(0),
+            b"0123456789abcdef"
+        );
+        assert!(normalized.column(1).is_null(1));
+
+        let aligned_list = normalized.column(2).as_list::<i32>();
+        assert_eq!(
+            aligned_list.values().as_string_view().value(0),
+            "long_nested_topic_value"
+        );
+        assert!(aligned_list.is_null(1));
+
+        let aligned_pair = normalized.column(3).as_fixed_size_list();
+        assert_eq!(
+            aligned_pair.values().as_string_view().value(0),
+            "fixed_slot_0_long"
+        );
+        assert_eq!(
+            aligned_pair.values().as_string_view().value(1),
+            "fixed_slot_1_long"
+        );
+    }
+
+    #[test]
     fn clickhouse_read_type_reads_a_hinted_wide_int_as_text() {
         use streamling_core::types::decimal_arb::{DecimalArbType, NativeIntKind};
         // The hint says how a sink writes the column; the history table of a
@@ -2459,6 +2657,16 @@ mod tests {
             "bounded1"
         );
 
+        hybrid_provider.snapshot_unbounded_offsets().await.unwrap();
+        assert!(
+            hybrid_provider
+                .state
+                .read()
+                .await
+                .unbounded_offsets
+                .is_none(),
+            "only the final bounded phase takes the snapshot"
+        );
         hybrid_provider.advance_to_next_phase().await.unwrap();
 
         let current_source = hybrid_provider.get_current_source().await.unwrap();
@@ -2470,6 +2678,7 @@ mod tests {
             "bounded2"
         );
 
+        hybrid_provider.snapshot_unbounded_offsets().await.unwrap();
         hybrid_provider.advance_to_next_phase().await.unwrap();
 
         let current_source = hybrid_provider.get_current_source().await.unwrap();
@@ -2997,12 +3206,14 @@ mod tests {
     #[derive(Debug)]
     struct FiniteMockTableProvider {
         schema: SchemaRef,
+        executions: Arc<std::sync::atomic::AtomicU32>,
     }
 
     impl FiniteMockTableProvider {
         fn new() -> Self {
             Self {
                 schema: create_test_schema(),
+                executions: Arc::default(),
             }
         }
     }
@@ -3024,6 +3235,7 @@ mod tests {
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(FiniteMockExec {
                 schema: self.schema.clone(),
+                executions: self.executions.clone(),
                 properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(self.schema.clone()),
                     datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
@@ -3038,6 +3250,7 @@ mod tests {
     #[derive(Debug)]
     struct FiniteMockExec {
         schema: SchemaRef,
+        executions: Arc<std::sync::atomic::AtomicU32>,
         properties: Arc<PlanProperties>,
     }
 
@@ -3071,6 +3284,8 @@ mod tests {
             _partition: usize,
             _context: Arc<TaskContext>,
         ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.executions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let schema = self.schema.clone();
             Ok(Box::pin(
                 datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
@@ -3552,6 +3767,162 @@ mod tests {
         );
     }
 
+    /// An archive whose Kafka position moves forward each time the bounded
+    /// scan starts, as a live archive does while a scan runs.
+    #[derive(Debug)]
+    struct ArchiveIngestingDuringScan {
+        scans_started: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait]
+    impl OffsetProvider for ArchiveIngestingDuringScan {
+        async fn get_offsets(&self) -> DataFusionResult<HashMap<i32, u32>> {
+            let position = self.scans_started.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(HashMap::from([(0, position)]))
+        }
+    }
+
+    /// BDA-3880: the unbounded phase must start from the archive position
+    /// read before the bounded scan started. Rows archived during the scan
+    /// sit above the scan's upper bound; a position read at the handoff
+    /// skips them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unbounded_offsets_are_snapshotted_before_final_bounded_scan() {
+        let bounded = FiniteMockTableProvider::new();
+        let offset_provider = ArchiveIngestingDuringScan {
+            scans_started: bounded.executions.clone(),
+        };
+
+        let config = HybridSourceConfig {
+            bounded_sources: vec![Arc::new(bounded)],
+            unbounded_source: Arc::new(FiniteMockTableProvider::new()),
+            offset_provider: Some(Arc::new(offset_provider)),
+            job_mode: false,
+        };
+
+        let hybrid_provider = HybridTableProvider::new(
+            "test_snapshot_before_scan".to_string(),
+            config,
+            create_test_schema(),
+            create_state_backend("test_snapshot_before_scan").await,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap();
+
+        let session_state = SESSION_MANAGER.session_state();
+        let plan = hybrid_provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let batches: Vec<_> = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed")
+            .collect()
+            .await;
+        for batch in &batches {
+            assert!(batch.is_ok(), "stream batch should not be an error");
+        }
+
+        let state = hybrid_provider.state.read().await;
+        assert_eq!(state.current_phase, 1, "should have reached unbounded");
+        assert_eq!(
+            state.unbounded_offsets,
+            Some(HashMap::from([(0, 0)])),
+            "unbounded phase must start from the pre-scan archive position"
+        );
+    }
+
+    fn single_bounded_hybrid(
+        offset_provider: Arc<dyn OffsetProvider>,
+        state_backend: Arc<dyn StateOperatorBackend<HybridSourceState>>,
+    ) -> HybridTableProvider {
+        HybridTableProvider::new(
+            "test_hybrid".to_string(),
+            HybridSourceConfig {
+                bounded_sources: vec![Arc::new(MockTableProvider::new("bounded1".to_string()))],
+                unbounded_source: Arc::new(MockTableProvider::new("unbounded".to_string())),
+                offset_provider: Some(offset_provider),
+                job_mode: false,
+            },
+            create_test_schema(),
+            state_backend,
+            SESSION_MANAGER.clone(),
+        )
+        .unwrap()
+    }
+
+    /// A restart mid-scan must keep the snapshot taken before the scan first
+    /// started: the archive position read at restart is ahead of rows the
+    /// scan has already passed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_persisted_snapshot_is_kept_across_restart() {
+        let state_backend = create_state_backend("test_persisted_snapshot_is_kept").await;
+
+        let first_run = single_bounded_hybrid(
+            Arc::new(MockOffsetProvider::new(HashMap::from([(0, 10)]))),
+            state_backend.clone(),
+        );
+        first_run.load_state().await.unwrap();
+        first_run.snapshot_unbounded_offsets().await.unwrap();
+
+        let restarted = single_bounded_hybrid(
+            Arc::new(MockOffsetProvider::new(HashMap::from([(0, 99)]))),
+            state_backend,
+        );
+        restarted.load_state().await.unwrap();
+        restarted.snapshot_unbounded_offsets().await.unwrap();
+
+        assert_eq!(
+            restarted.state.read().await.unbounded_offsets,
+            Some(HashMap::from([(0, 10)]))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_snapshot_propagates_offset_provider_failure() {
+        let hybrid_provider = single_bounded_hybrid(
+            Arc::new(FailingOffsetProvider),
+            create_state_backend("test_snapshot_propagates_failure").await,
+        );
+
+        let err = hybrid_provider
+            .snapshot_unbounded_offsets()
+            .await
+            .expect_err("a failed snapshot must not let the bounded scan start");
+        assert!(
+            err.to_string().contains("injected offset provider failure"),
+            "got: {err}"
+        );
+        assert!(
+            hybrid_provider
+                .state
+                .read()
+                .await
+                .unbounded_offsets
+                .is_none()
+        );
+    }
+
+    /// Without a snapshot the handoff has no safe Kafka position; it must
+    /// fail instead of reading the provider's current position.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handoff_without_snapshot_is_an_error() {
+        let hybrid_provider = single_bounded_hybrid(
+            Arc::new(MockOffsetProvider::new(HashMap::from([(0, 10)]))),
+            create_state_backend("test_handoff_without_snapshot").await,
+        );
+
+        let err = hybrid_provider
+            .advance_to_next_phase()
+            .await
+            .expect_err("handoff must require the snapshot");
+        assert!(
+            err.to_string()
+                .contains("no unbounded offset snapshot at the handoff"),
+            "got: {err}"
+        );
+    }
+
     use streamling_state::testing::{FailCondition, FailableStateBackend};
 
     // ========================================================================
@@ -3596,10 +3967,18 @@ mod tests {
         )
         .unwrap();
 
-        let result = hybrid_provider.advance_to_next_phase().await;
+        // The snapshot's own save hits the same injected fault, so set it
+        // in memory: the handoff must reach its save_state.
+        hybrid_provider.state.write().await.unbounded_offsets =
+            Some(HashMap::from([(0, 1000), (1, 2000)]));
+
+        let err = hybrid_provider
+            .advance_to_next_phase()
+            .await
+            .expect_err("save_state should fail due to injected fault");
         assert!(
-            result.is_err(),
-            "save_state should fail due to injected fault"
+            err.to_string().contains("state backend error"),
+            "expected the save_state failure, got: {err}"
         );
 
         // FM6: in-memory phase advanced despite save failure
@@ -3972,6 +4351,10 @@ mod tests {
         .unwrap();
 
         provider.load_state().await.unwrap();
+        provider
+            .snapshot_unbounded_offsets()
+            .await
+            .expect("job_mode must not call the offset provider for a snapshot");
         // Advance past the single bounded phase (0 -> 1 == bounded_sources.len()),
         // the unbounded transition. In job_mode it must skip the offset provider.
         let result = provider.advance_to_next_phase().await;

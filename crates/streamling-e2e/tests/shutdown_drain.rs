@@ -410,8 +410,7 @@ sinks:
 /// `stream.next()` until the whole table had been read, blew the shutdown
 /// budget, and the watchdog force-exited without a terminal drain. The table
 /// here is large enough that the scan is still running when the signal
-/// lands; if a fast machine finishes it first the test degrades to the
-/// (already covered) streaming-phase path rather than flaking.
+/// lands.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_sigterm_during_bounded_phase_drains_and_exits() {
@@ -529,6 +528,12 @@ sinks:
     assert!(
         count > 0,
         "sink must contain the drained prefix of the bounded scan"
+    );
+    // The default page size holds the whole table in one page, so this fails
+    // if the scan only observes the signal between pages.
+    assert!(
+        count < 500_000,
+        "the bounded scan must end early on SIGTERM, but all {count} rows were drained"
     );
 }
 

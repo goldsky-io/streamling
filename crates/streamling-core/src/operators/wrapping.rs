@@ -8,6 +8,7 @@ use crate::operators::scan_sharing::{BroadcastingExec, SharedSourceHandle, Share
 use crate::session::{get_streamling_config, get_streamling_config_from_session};
 use crate::side_output::{SourceSideOutput, SupportsSideOutputs};
 use crate::telemetry::EventTimeReader;
+use crate::telemetry::MillisAccumulator;
 use crate::telemetry::recorder::{MetricsRecorder, get_metrics_recorder};
 use crate::telemetry::types::RowCountMeasurementType;
 use crate::topology::Telemetry;
@@ -194,6 +195,9 @@ pub struct WrappingSourceTableProvider {
     /// `WrappingExec` constructed for this source so the running watermark
     /// state is not duplicated.
     event_time_instrumentation: Option<EventTimeInstrumentation>,
+    /// The node the rows entering this source count as input for: the source itself, a
+    /// hybrid source for its phases, or `None` for a hybrid source, whose phases count them.
+    input_rows_id: Option<String>,
 }
 
 impl WrappingSourceTableProvider {
@@ -205,11 +209,19 @@ impl WrappingSourceTableProvider {
     ) -> Self {
         Self {
             inner,
-            reference_name,
             side_outputs: Arc::new(RwLock::new(Vec::new())),
             scan_sharing_registry,
             event_time_instrumentation: EventTimeInstrumentation::from_telemetry(telemetry),
+            input_rows_id: Some(reference_name.clone()),
+            reference_name,
         }
+    }
+
+    /// Count the rows entering this source as input of `id` instead of this source: a
+    /// hybrid phase counts for its hybrid source. `None`: the source counts no input rows.
+    pub fn with_input_rows_id(mut self, id: Option<String>) -> Self {
+        self.input_rows_id = id;
+        self
     }
 
     pub fn get_inner(&self) -> Arc<dyn TableProvider> {
@@ -234,7 +246,36 @@ impl WrappingSourceTableProvider {
         reference_name: &str,
         side_outputs: Vec<Arc<dyn SourceSideOutput>>,
         event_time_instrumentation: Option<EventTimeInstrumentation>,
+        input_rows_id: Option<String>,
     ) -> Arc<dyn ExecutionPlan> {
+        let below_filter = Self::wrap_below_filter(
+            inner_exec,
+            reference_name,
+            side_outputs,
+            event_time_instrumentation,
+            input_rows_id,
+        );
+        // The rows the source node outputs, after its filter: what downstream nodes receive.
+        Arc::new(
+            WrappingExec::new(
+                below_filter,
+                reference_name.to_string(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .with_role(WrappingRole::SourceOutput),
+        )
+    }
+
+    fn wrap_below_filter(
+        inner_exec: Arc<dyn ExecutionPlan>,
+        reference_name: &str,
+        side_outputs: Vec<Arc<dyn SourceSideOutput>>,
+        event_time_instrumentation: Option<EventTimeInstrumentation>,
+        input_rows_id: Option<String>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let source_input = WrappingRole::SourceInput { input_rows_id };
         // A pushed-down scan projection may sit above the source filter (the
         // filter plans against the full payload schema and the projection is
         // re-applied above it — see the Kafka source). See through the
@@ -247,13 +288,16 @@ impl WrappingSourceTableProvider {
                 .downcast_ref::<StreamingFilterExec>()
         {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-                source_exec,
-                reference_name.to_string(),
-                side_outputs.clone(),
-                Vec::new(),
-                event_time_instrumentation.clone(),
-            ));
+            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
+                WrappingExec::new(
+                    source_exec,
+                    reference_name.to_string(),
+                    side_outputs.clone(),
+                    Vec::new(),
+                    event_time_instrumentation.clone(),
+                )
+                .with_role(source_input.clone()),
+            );
             // Mark the re-applied filter/projection as source-owned: they sit
             // ABOVE this source's `WrappingExec`, i.e. inside the downstream
             // consumer's plan subtree, and must act as a topology boundary so
@@ -279,13 +323,16 @@ impl WrappingSourceTableProvider {
 
         if let Some(filter_exec) = inner_exec.downcast_ref::<StreamingFilterExec>() {
             let source_exec = filter_exec.input().clone();
-            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(WrappingExec::new(
-                source_exec,
-                reference_name.to_string(),
-                side_outputs.clone(),
-                Vec::new(),
-                event_time_instrumentation.clone(),
-            ));
+            let wrapped_source: Arc<dyn ExecutionPlan> = Arc::new(
+                WrappingExec::new(
+                    source_exec,
+                    reference_name.to_string(),
+                    side_outputs.clone(),
+                    Vec::new(),
+                    event_time_instrumentation.clone(),
+                )
+                .with_role(source_input.clone()),
+            );
             // Source-owned for the same reason as the projection+filter
             // branch above: this filter is re-applied above the source's
             // `WrappingExec` and must bound downstream metric aggregation.
@@ -299,23 +346,29 @@ impl WrappingSourceTableProvider {
                          Falling back to wrapping the filtered plan.",
                         reference_name, e
                     );
-                    Arc::new(WrappingExec::new(
-                        inner_exec,
-                        reference_name.to_string(),
-                        side_outputs,
-                        Vec::new(),
-                        event_time_instrumentation,
-                    ))
+                    Arc::new(
+                        WrappingExec::new(
+                            inner_exec,
+                            reference_name.to_string(),
+                            side_outputs,
+                            Vec::new(),
+                            event_time_instrumentation,
+                        )
+                        .with_role(source_input),
+                    )
                 }
             }
         } else {
-            Arc::new(WrappingExec::new(
-                inner_exec,
-                reference_name.to_string(),
-                side_outputs,
-                Vec::new(),
-                event_time_instrumentation,
-            ))
+            Arc::new(
+                WrappingExec::new(
+                    inner_exec,
+                    reference_name.to_string(),
+                    side_outputs,
+                    Vec::new(),
+                    event_time_instrumentation,
+                )
+                .with_role(source_input),
+            )
         }
     }
 }
@@ -405,6 +458,7 @@ impl TableProvider for WrappingSourceTableProvider {
                 &reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                self.input_rows_id.clone(),
             );
 
             // Get internal_buffer_size from Session config
@@ -452,6 +506,7 @@ impl TableProvider for WrappingSourceTableProvider {
                 &self.reference_name,
                 side_outputs,
                 self.event_time_instrumentation.clone(),
+                self.input_rows_id.clone(),
             ))
         }
     }
@@ -484,6 +539,35 @@ pub struct WrappingExec {
     /// reconstruction so per-source watermark state survives DataFusion
     /// optimizer rewrites.
     event_time_instrumentation: Option<EventTimeInstrumentation>,
+    role: WrappingRole,
+}
+
+/// What a `WrappingExec` measures for its topology node.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WrappingRole {
+    /// A transform: its output rows, plus compute, checkpoint and live-inspect telemetry.
+    Node,
+    /// Directly above a source's connector, below its filter: the rows pulled in count as
+    /// input of `input_rows_id` (none when the phases of a hybrid source count them), and
+    /// side outputs and event-time freshness observe every row.
+    SourceInput { input_rows_id: Option<String> },
+    /// The top of a source's plan, above its filter: the rows the source outputs.
+    SourceOutput,
+}
+
+/// The span of an input poll to attribute to `starved`. A poll only counts as
+/// starvation when it actually yields an input batch (`Some(Ok(_))`). A `None`
+/// result is end-of-stream, so its poll-to-EOF wait is pipeline
+/// shutdown/teardown (source teardown, a producer finishing); a `Some(Err(_))`
+/// is an upstream failure/termination, not a batch that arrived. Neither is
+/// time genuinely spent waiting for the next batch, and neither is folded into
+/// `elapsed_compute` (which also only counts `Ok` batches) — attribute nothing
+/// for them.
+fn starved_span_for_poll<T, E>(poll_result: &Option<Result<T, E>>, waited: Duration) -> Duration {
+    match poll_result {
+        Some(Ok(_)) => waited,
+        _ => Duration::ZERO,
+    }
 }
 
 impl crate::operators::TopologyBoundary for WrappingExec {
@@ -533,7 +617,13 @@ impl WrappingExec {
             forced_non_null_columns,
             adjusted_schema,
             event_time_instrumentation,
+            role: WrappingRole::Node,
         }
+    }
+
+    pub fn with_role(mut self, role: WrappingRole) -> Self {
+        self.role = role;
+        self
     }
 }
 
@@ -587,13 +677,16 @@ impl ExecutionPlan for WrappingExec {
         // SAME watermark state Arc — without this, DataFusion optimizer
         // rewrites would silently start a fresh watermark for every
         // reconstruction.
-        Ok(Arc::new(WrappingExec::new(
-            new_inner,
-            self.reference_name.clone(),
-            self.side_outputs.clone(),
-            self.forced_non_null_columns.clone(),
-            self.event_time_instrumentation.clone(),
-        )))
+        Ok(Arc::new(
+            WrappingExec::new(
+                new_inner,
+                self.reference_name.clone(),
+                self.side_outputs.clone(),
+                self.forced_non_null_columns.clone(),
+                self.event_time_instrumentation.clone(),
+            )
+            .with_role(self.role.clone()),
+        ))
     }
 
     fn execute(
@@ -624,7 +717,8 @@ impl ExecutionPlan for WrappingExec {
         // (`elapsed_compute`, ...) when its `execute` is called. Snapshotting
         // before that returned an empty set whose live Arc-backed counters were
         // never captured, so a SQL transform's compute never reached
-        // `elapsed_compute`. The `MetricsSet` holds Arc-shared counters, so
+        // `elapsed_compute` and `busy = elapsed_compute - starved` collapsed to
+        // the per-batch seed. The `MetricsSet` holds Arc-shared counters, so
         // this single read stays live as batches flow.
         let metrics = self.metrics();
 
@@ -637,10 +731,14 @@ impl ExecutionPlan for WrappingExec {
         // whose input is directly the upstream topology boundary), the delta
         // path can never emit, so wall-clock stays on as the only available
         // signal rather than leaving the series dead.
-        let record_wall_clock_compute = should_record_wall_clock_compute(
-            metrics.is_some(),
-            metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
-        );
+        let role = self.role.clone();
+        // The output counter above a source's filter only counts rows: the input wrapper
+        // below it already records this node's compute and checkpoint telemetry.
+        let record_wall_clock_compute = role != WrappingRole::SourceOutput
+            && should_record_wall_clock_compute(
+                metrics.is_some(),
+                metrics_recorder.resolve_is_sql_node(&metric_metadata_id),
+            );
 
         let side_outputs = self.side_outputs.clone();
         let event_time_instrumentation = self.event_time_instrumentation.clone();
@@ -648,10 +746,35 @@ impl ExecutionPlan for WrappingExec {
         let schema = self.schema();
 
         let measured_stream = async_stream::stream! {
+            // `starved`: time in `data.next().await`, waiting on upstream.
+            // Remainder-carrying so sub-ms spans aren't truncated to zero at
+            // high throughput.
+            let mut starved = MillisAccumulator::default();
             loop {
                 let batch_start = Instant::now();
                 let batch_result = data.next().await;
                 let batch_elapsed = batch_start.elapsed();
+                // `starved`: time waiting on upstream for input. Node-local, so
+                // `downstream_id=""`; the label is present so a later `blocked`
+                // state can share the same key set. Only a delivered batch
+                // (`Some(Ok)`) counts; a `None` poll is EOF and a `Some(Err)`
+                // is an upstream failure — attribute nothing for either.
+                // A source's `SourceOutput` wrapper waits on its `SourceInput` wrapper,
+                // which already measures this node's input wait.
+                if role != WrappingRole::SourceOutput {
+                    starved.add(starved_span_for_poll(&batch_result, batch_elapsed));
+                }
+                // After a successful drain only a <1ms remainder remains; EOF/error polls
+                // add zero, so they cannot emit a carried whole millisecond.
+                let starved_ms = starved.take_whole_millis();
+                if starved_ms > 0 {
+                    metrics_recorder.record_count_w_tags(
+                        "node_wait",
+                        starved_ms,
+                        vec![("state", "starved"), ("downstream_id", "")],
+                        &metric_metadata_id,
+                    );
+                }
 
                 let batch_result = match batch_result {
                     Some(r) => r,
@@ -660,19 +783,68 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
-                        // Record per-batch compute time (non-sql nodes only;
-                        // see `record_wall_clock_compute` above)
-                        if record_wall_clock_compute {
-                            metrics_recorder.record_elapsed_compute(batch_elapsed, &metric_metadata_id);
-                        }
+                        // Deprecated back-compat dual-emit: input-wait is also
+                        // folded into `elapsed_compute` so existing dashboards are
+                        // unchanged. Pure compute is `elapsed_compute -
+                        // node_wait{state="starved"}`; remove once consumers
+                        // migrate to the `starved` state.
+                        //
+                        // Fold the SAME remainder-carrying whole-ms value drained
+                        // for `starved` (not the raw `batch_elapsed`) so both
+                        // series quantize the span identically. Flooring each
+                        // batch here instead would drop the sub-ms remainder that
+                        // `starved` carries, making the folded input-wait fall
+                        // below `starved` and `busy = elapsed_compute - starved`
+                        // drift negative at high throughput — the exact failure
+                        // the `MillisAccumulator` exists to prevent.
+                        //
+                        // A SQL transform with subtree metrics folds it into the
+                        // batch's compute delta (`record_execution_plan_metrics`)
+                        // so the histogram keeps one observation per batch.
+                        let sql_input_wait_ms = if role == WrappingRole::SourceOutput {
+                            0
+                        } else if !record_wall_clock_compute {
+                            starved_ms
+                        } else {
+                            // No whole starved millisecond this batch: keep #85's
+                            // wall-clock path for non-SQL / passthrough SQL so
+                            // sub-ms compute isn't dropped entirely.
+                            let folded = if starved_ms > 0 {
+                                Duration::from_millis(starved_ms)
+                            } else {
+                                batch_elapsed
+                            };
+                            metrics_recorder.record_elapsed_compute(folded, &metric_metadata_id);
+                            0
+                        };
 
                         // Process telemetry
-                        metrics_recorder.record_execution_plan_metrics(
-                            metric_metadata_id.as_str(),
-                            batch.num_rows(),
-                            RowCountMeasurementType::OutputRowCount,
-                            metrics.as_ref(),
-                        );
+                        match &role {
+                            WrappingRole::Node | WrappingRole::SourceOutput => {
+                                metrics_recorder.record_execution_plan_metrics(
+                                    metric_metadata_id.as_str(),
+                                    &batch,
+                                    RowCountMeasurementType::OutputRowCount,
+                                    metrics.as_ref(),
+                                    sql_input_wait_ms,
+                                );
+                            }
+                            WrappingRole::SourceInput { input_rows_id } => {
+                                if let Some(input_rows_id) = input_rows_id {
+                                    metrics_recorder.record_execution_plan_metrics(
+                                        input_rows_id.as_str(),
+                                        &batch,
+                                        RowCountMeasurementType::SourceInputRowCount,
+                                        None,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                        if role == WrappingRole::SourceOutput {
+                            yield Ok(batch);
+                            continue;
+                        }
 
                         // Record checkpoint marker arrival time for transforms
                         let checkpoint_messages = extract_checkpoint_messages(batch.schema().metadata());
@@ -812,9 +984,10 @@ impl DataSink for WrappingDataSink {
                     Ok(batch) => {
                         metrics_recorder.record_execution_plan_metrics(
                             metric_metadata_id.as_str(),
-                            batch.num_rows(),
+                            &batch,
                             RowCountMeasurementType::InputRowCount,
                             metrics.as_ref(),
+                            0,
                         );
 
                         // End-to-end freshness at sink ingress. Same code
@@ -1283,7 +1456,15 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
+
+        // The source's output counter sits on top, above its filter.
+        let output_counter = result
+            .downcast_ref::<WrappingExec>()
+            .expect("top-level plan is the source output counter");
+        assert_eq!(output_counter.role, WrappingRole::SourceOutput);
+        let result = output_counter.inner.clone();
 
         // Order must be projection -> filter -> wrapper -> source, so side
         // outputs / event-time observe every pre-filter row (R7). Both
@@ -1323,6 +1504,57 @@ mod tests {
         );
     }
 
+    /// Side outputs at the source wrapper see every pre-filter row, while the
+    /// filter still drops rows above it. The row metrics are covered in
+    /// `recorder::pipeline_io_delta_tests`.
+    #[tokio::test]
+    async fn test_side_outputs_see_rows_before_source_filter() {
+        let schema = test_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>())),
+                Arc::new(Int64Array::from(
+                    (0..10).map(|i| i * 1000).collect::<Vec<i64>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    (0..10).map(|i| i < 3).collect::<Vec<bool>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = FilterExec::try_new(predicate, source_exec).unwrap();
+        let streaming_filter =
+            Arc::new(StreamingFilterExec::from_original(filter).unwrap()) as Arc<dyn ExecutionPlan>;
+
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+        let plan = WrappingSourceTableProvider::wrap_with_side_outputs_before_filter(
+            streaming_filter,
+            "test_source",
+            vec![Arc::new(CountingSideOutput {
+                rows_seen: rows_seen.clone(),
+            })],
+            None,
+            Some("test_source".to_string()),
+        );
+
+        let output = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let output_rows: usize = output.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows_seen.load(Ordering::Relaxed),
+            10,
+            "pre-filter rows at the source wrapper"
+        );
+        assert_eq!(output_rows, 3, "filter still applied above the wrapper");
+    }
+
     #[test]
     fn test_wrap_with_side_outputs_before_filter_reorders_plan() {
         let schema = test_schema();
@@ -1349,7 +1581,15 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
+
+        // The source's output counter sits on top, above its filter.
+        let output_counter = result
+            .downcast_ref::<WrappingExec>()
+            .expect("top-level plan is the source output counter");
+        assert_eq!(output_counter.role, WrappingRole::SourceOutput);
+        let result = output_counter.inner.clone();
 
         // The top-level plan should be a StreamingFilterExec (filter is on top)
         let rebuilt_filter = result
@@ -1395,6 +1635,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
 
         // Without a filter, the top-level plan should be WrappingExec directly
@@ -1430,6 +1671,7 @@ mod tests {
             "test_source",
             vec![side_output],
             None,
+            Some("test_source".to_string()),
         );
 
         let task_ctx = Arc::new(TaskContext::default());
@@ -1626,6 +1868,7 @@ mod tests {
             "test_source",
             Vec::new(),
             Some(inst),
+            Some("test_source".to_string()),
         );
 
         // result is StreamingFilterExec → child is WrappingExec with our instrumentation.
@@ -1699,6 +1942,335 @@ mod tests {
         // `true` and the warn-log path is skipped.
         emit_event_time_metrics(&inst, &batch, "test_source", recorder.as_ref());
         assert!(inst.read_error_logged.load(Ordering::Relaxed));
+    }
+
+    /// Drives a `WrappingExec` with a slow consumer so the yield->resume span
+    /// exceeds a millisecond; guards that the instrumented loop still delivers
+    /// every row without panicking or hanging. Uses an *unregistered* node id so
+    /// it doesn't mutate the global recorder (the emission returns early at the
+    /// metadata lookup; counter-registry dispatch is covered by
+    /// `node_wait_counter_is_registered`).
+    #[tokio::test]
+    async fn wrapping_exec_streams_all_rows_under_slow_consumer() {
+        let schema = test_schema();
+        // Three batches in a single partition → multiple yield/resume cycles.
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let source_exec = mem_table.scan(&state, None, &[], None).await.unwrap();
+
+        let wrapping = Arc::new(WrappingExec::new(
+            source_exec,
+            "bp_unregistered_node".to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+
+        let mut total_rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch must be Ok");
+            total_rows += batch.num_rows();
+            // Slow consumer: force >1ms of backpressure before the next poll.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        assert_eq!(
+            total_rows,
+            test_batch().num_rows() * 3,
+            "all rows must flow through the instrumented loop"
+        );
+    }
+
+    /// A test-only source that delays before yielding each input batch, so the
+    /// `WrappingExec`'s `data.next().await` genuinely blocks on upstream — the
+    /// condition that produces `node_wait{state="starved"}`. Delegates schema
+    /// and plan properties to a wrapped `inner` (a `MemTable` scan) so we don't
+    /// have to hand-build `PlanProperties`.
+    #[derive(Debug)]
+    struct SlowInputExec {
+        inner: Arc<dyn ExecutionPlan>,
+        per_batch_delay: Duration,
+    }
+
+    impl DisplayAs for SlowInputExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "SlowInputExec")
+        }
+    }
+
+    impl ExecutionPlan for SlowInputExec {
+        fn name(&self) -> &str {
+            "SlowInputExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(SlowInputExec {
+                inner: children.swap_remove(0),
+                per_batch_delay: self.per_batch_delay,
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let mut input = self.inner.execute(partition, context)?;
+            let delay = self.per_batch_delay;
+            let schema = self.schema();
+            let stream = async_stream::stream! {
+                loop {
+                    // The sleep happens inside the poll the WrappingExec awaits,
+                    // so it is measured as time waiting on upstream input.
+                    tokio::time::sleep(delay).await;
+                    match input.next().await {
+                        Some(batch) => yield batch,
+                        None => break,
+                    }
+                }
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    /// `WrappingExec::execute` must emit `node_wait{state="starved"}` when its
+    /// input stream makes it wait on upstream. Drives a slow source (10ms per
+    /// batch) under a fast consumer and reads the emitted counter back via the
+    /// in-process collectable meter provider.
+    // The std `TEST_LOCK` is intentionally held across await points to serialize
+    // these tests against every other test that mutates the global recorder
+    // singleton. Each `#[tokio::test]` runs on its own single-threaded runtime
+    // and no task on that runtime ever contends this lock, so the usual
+    // await-holding-lock starvation hazard does not apply.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wrapping_exec_emits_starved_when_input_is_slow() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "starved_unit_source";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        // Three batches → three delayed input polls that each count as starvation.
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(10),
+        });
+
+        let wrapping = Arc::new(WrappingExec::new(
+            slow_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        let mut total_rows = 0usize;
+        // Fast consumer: no sleep, so backpressure stays ~0 and the wait we
+        // observe is upstream starvation, not downstream blocking.
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.expect("batch must be Ok").num_rows();
+        }
+        assert_eq!(
+            total_rows,
+            test_batch().num_rows() * 3,
+            "all rows must flow through"
+        );
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        // ~30ms expected (3 × 10ms); assert well below that so scheduling
+        // jitter on a loaded CI box can't flake it, but high enough to prove
+        // real starvation was recorded rather than a stray sub-ms tick.
+        assert!(
+            starved >= 10,
+            "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
+        );
+    }
+
+    /// A filtered source has two wrappers: `SourceInput` below the filter and
+    /// `SourceOutput` above it, both under the source's id. The `SourceOutput`
+    /// wrapper's input wait is the `SourceInput` wrapper's wait plus the filter,
+    /// so it must emit neither `starved` nor a folded input wait; otherwise the
+    /// source's starved and elapsed_compute count the connector wait twice.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn source_output_wrapper_records_no_input_wait() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "source_output_no_wait";
+        test_support::init_recorder_with_node(node_id);
+
+        let schema = test_schema();
+        let mem_table = MemTable::try_new(
+            schema.clone(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_millis(10),
+        });
+        let predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("active", 2));
+        let filter = Arc::new(
+            StreamingFilterExec::from_original(FilterExec::try_new(predicate, slow_input).unwrap())
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let output_counter = Arc::new(
+            WrappingExec::new(filter, node_id.to_string(), vec![], vec![], None)
+                .with_role(WrappingRole::SourceOutput),
+        );
+        let mut stream = output_counter.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch must be Ok");
+        }
+
+        assert_eq!(test_support::node_wait_ms(node_id, "starved", None), 0);
+        // ~30ms of input wait would show here if folded; the filter's own
+        // compute over three tiny batches stays far below that.
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+        assert!(
+            elapsed_compute < 10,
+            "SourceOutput folded its input wait into elapsed_compute: {elapsed_compute}ms"
+        );
+    }
+
+    /// Regression: the input-wait span dual-emitted into `elapsed_compute` and
+    /// `node_wait{state="starved"}` must use identical quantization, otherwise
+    /// the advertised `busy = elapsed_compute - starved` accounting drifts.
+    ///
+    /// `starved` carries the sub-ms remainder (via `MillisAccumulator`), so if
+    /// `elapsed_compute` instead floors each batch independently it drops that
+    /// remainder and its input-wait portion falls *below* `starved` — exactly
+    /// the case the accumulator was meant to fix. This node is a non-SQL source
+    /// with no subtree metrics, so `elapsed_compute` is only the folded
+    /// input-wait (series existence is seeded once per node at pipeline start,
+    /// not per batch):
+    ///
+    /// ```text
+    /// elapsed_compute == starved (folded input-wait)
+    /// ```
+    ///
+    /// Both series derive from the same integer whole-ms drains, so this holds
+    /// exactly regardless of scheduling jitter. Pre-fix, the floored input-wait
+    /// is strictly less than `starved` whenever any sub-ms remainder accrues, so
+    /// the equality fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see note on wrapping_exec_emits_starved_when_input_is_slow
+    async fn elapsed_compute_input_wait_fold_matches_starved_quantization() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "busy_quantization_source";
+        test_support::init_recorder_with_node(node_id);
+
+        const NUM_BATCHES: u64 = 30;
+
+        let schema = test_schema();
+        // Each batch carries a fractional-ms input wait (~1.5ms). Per-batch
+        // flooring would drop ~0.5ms every batch, so across many batches the
+        // dropped remainder accrues to several whole milliseconds — enough to
+        // pull a floored `elapsed_compute` below the remainder-carrying `starved`.
+        let batches: Vec<RecordBatch> = std::iter::repeat_with(test_batch)
+            .take(NUM_BATCHES as usize)
+            .collect();
+        let mem_table = MemTable::try_new(schema.clone(), vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: Duration::from_micros(1_500),
+        });
+
+        let wrapping = Arc::new(WrappingExec::new(
+            slow_input,
+            node_id.to_string(),
+            vec![],
+            vec![],
+            None,
+        ));
+
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch must be Ok");
+        }
+
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let elapsed_compute = test_support::elapsed_compute_ms(node_id);
+
+        // Real starvation must have been recorded, otherwise the comparison is
+        // vacuous (a stuck source would report 0 for both).
+        assert!(
+            starved >= 10,
+            "expected real starvation to be recorded, got starved={starved}ms"
+        );
+        // Folded input-wait must equal `starved` exactly (identical
+        // quantization). This keeps `busy = elapsed_compute - starved` == pure
+        // compute (here 0), never corrupted by dropped sub-ms remainders.
+        assert_eq!(
+            elapsed_compute, starved,
+            "elapsed_compute ({elapsed_compute}ms) must equal starved ({starved}ms); \
+             a mismatch means the input-wait fold used a different quantization than starved"
+        );
+    }
+
+    /// A poll that yields a batch counts its wait as `starved`, but a poll that
+    /// returns `None` (end-of-stream) or `Some(Err)` (upstream failure) must
+    /// contribute nothing — those waits are pipeline shutdown / error handling,
+    /// not upstream starvation, and neither is folded into `elapsed_compute`.
+    #[test]
+    fn only_delivered_batch_poll_is_counted_as_starved() {
+        let waited = Duration::from_millis(50);
+
+        // Delivered input: the wait is genuine starvation.
+        assert_eq!(
+            starved_span_for_poll(&Some(Ok::<(), ()>(())), waited),
+            waited
+        );
+
+        // End-of-stream: the teardown wait is not starvation.
+        assert_eq!(
+            starved_span_for_poll::<(), ()>(&None, waited),
+            Duration::ZERO
+        );
+
+        // Upstream error: no batch arrived, so this is not starvation either.
+        assert_eq!(
+            starved_span_for_poll(&Some(Err::<(), ()>(())), waited),
+            Duration::ZERO
+        );
     }
 
     /// Records every row the inner sink actually receives.

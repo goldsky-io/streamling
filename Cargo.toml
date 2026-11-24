@@ -102,7 +102,7 @@ bigdecimal = "0.4.8"
 clap = { version = "4.5", features = ["derive"] }
 
 # WASM dependencies
-extism = "1.30.0"
+extism = "1.41.0"
 
 # TypeScript to JavaScript transpiler dependencies
 swc = { version = "43.0.0", default-features = false }

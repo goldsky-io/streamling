@@ -118,13 +118,15 @@ impl DataSink for PrintSink {
                     // the same path SIGTERM takes (test-only mode).
                     streamling_core::shutdown::request_shutdown();
                     //need to flush since we are breaking the outer loop
-                    metrics_recorder.record_output_rows_count(
+                    metrics_recorder.record_sink_write(
+                        &batch,
                         num_of_printed_rows.value() as u64,
                         self.metric_metadata_id.as_ref(),
                     );
                     break 'outer;
                 }
-                metrics_recorder.record_output_rows_count(
+                metrics_recorder.record_sink_write(
+                    &batch,
                     num_of_printed_rows.value() as u64,
                     self.metric_metadata_id.as_ref(),
                 );

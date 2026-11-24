@@ -1178,13 +1178,12 @@ fn quote_inexact_literals_near_decimal_arb(stmt: &mut Statement, names: &Decimal
                     quote_all(array.elem.iter_mut().collect());
                 }
             }
-            SqlExpr::Function(func) => {
-                if function_name(func)
-                    .is_some_and(|name| DECIMAL_ARB_ARGUMENT_FUNCTIONS.contains(&name.as_str()))
-                    && function_args(func).into_iter().any(|a| names.is_decimal(a))
-                {
-                    quote_all(function_args_mut(func));
-                }
+            SqlExpr::Function(func)
+                if function_name(func).is_some_and(|name| {
+                    DECIMAL_ARB_ARGUMENT_FUNCTIONS.contains(&name.as_str())
+                }) && function_args(func).into_iter().any(|a| names.is_decimal(a)) =>
+            {
+                quote_all(function_args_mut(func));
             }
             _ => {}
         }

@@ -35,19 +35,12 @@ async fn setup_with_prometheus() -> Result<TestContext> {
 async fn test_basic_metrics_emission() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
-    // Skip if Prometheus is not available
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 25u64;
@@ -172,18 +165,12 @@ sinks:
 async fn test_checkpoint_metrics_emission() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 50u64;
@@ -327,18 +314,12 @@ sinks:
 async fn test_metrics_with_instance_id() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -433,18 +414,12 @@ sinks:
 async fn test_kafka_lag_reports_zero_when_caught_up() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -679,18 +654,12 @@ sinks:
 async fn test_event_time_metrics_kafka_source() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -797,18 +766,12 @@ sinks:
 async fn test_event_time_metrics_pre_filter_observation() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;
@@ -903,10 +866,11 @@ sinks:
     );
 }
 
-/// Backwards-compat: pipeline without `telemetry` configured emits no
-/// event-time series. R11 — strictly additive.
+/// `input_rows` counts the rows that enter a node. A source counts its rows
+/// before its `filter:` (all 10 were pulled in), but a transform below that
+/// source must count only the rows the filter lets through (4).
 #[tokio::test]
-async fn test_event_time_metrics_absent_when_not_configured() {
+async fn test_transform_input_rows_count_post_filter_rows() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -914,13 +878,128 @@ async fn test_event_time_metrics_absent_when_not_configured() {
             return;
         }
     };
-
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
         None => {
             eprintln!("Skipping test - Prometheus not configured");
             return;
         }
+    };
+
+    let total_records = 10u64;
+    let post_filter_records = 4u64; // ids 7, 8, 9, 10 pass `id > 6`
+
+    ctx.kafka
+        .register_schema(TEST_SCHEMA)
+        .await
+        .expect("Failed to register schema");
+    let records: Vec<TestRecord> = (1..=total_records as i64)
+        .map(|i| TestRecord {
+            id: i,
+            data: format!("data_{}", i),
+            timestamp: 1_700_000_000 + i,
+        })
+        .collect();
+    ctx.kafka
+        .produce_avro_records(&records)
+        .await
+        .expect("Failed to produce records");
+
+    let pipeline_yaml = format!(
+        r#"
+sources:
+  kafka_source:
+    type: kafka
+    topic: {}
+    primary_key: id
+    filter: "id > 6"
+
+transforms:
+  sql_transform:
+    type: sql
+    sql: "SELECT id, data, _gs_op FROM kafka_source"
+    primary_key: id
+
+sinks:
+  postgres_sink:
+    type: postgres
+    from: sql_transform
+    table: test_transform_input_rows_post_filter
+    schema: public
+    on_conflict: update
+"#,
+        ctx.kafka_topic
+    );
+
+    let status = ctx
+        .run_pipeline_with_opts(
+            &pipeline_yaml,
+            PipelineOpts::new().record_limit(post_filter_records),
+        )
+        .await
+        .expect("Failed to run pipeline");
+    assert!(status.success(), "Pipeline should complete successfully");
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let source_input = prometheus
+        .query_count(
+            &streamling_e2e::resources::PrometheusResource::input_rows_query(
+                "kafka_source",
+                Some(&ctx.test_id),
+            ),
+        )
+        .await
+        .expect("Failed to query source input rows");
+    assert_eq!(
+        source_input,
+        Some(total_records),
+        "source input_rows counts every row pulled in, before the filter"
+    );
+
+    let source_output = prometheus
+        .query_count(
+            &streamling_e2e::resources::PrometheusResource::output_rows_query(
+                "kafka_source",
+                Some(&ctx.test_id),
+            ),
+        )
+        .await
+        .expect("Failed to query source output rows");
+    assert_eq!(
+        source_output,
+        Some(post_filter_records),
+        "source output_rows counts the rows after its filter"
+    );
+
+    let transform_input = prometheus
+        .query_count(
+            &streamling_e2e::resources::PrometheusResource::input_rows_query(
+                "sql_transform",
+                Some(&ctx.test_id),
+            ),
+        )
+        .await
+        .expect("Failed to query transform input rows");
+    assert_eq!(
+        transform_input,
+        Some(post_filter_records),
+        "transform input_rows must count only the rows the source filter lets through"
+    );
+}
+
+/// Backwards-compat: pipeline without `telemetry` configured emits no
+/// event-time series. R11 — strictly additive.
+#[tokio::test]
+async fn test_event_time_metrics_absent_when_not_configured() {
+    let ctx = match setup_with_prometheus().await {
+        Ok(ctx) => ctx,
+        Err(e) => panic!("Failed to create test context: {}", e),
+    };
+
+    let prometheus = match &ctx.prometheus {
+        Some(p) => p,
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 5u64;
@@ -1005,18 +1084,12 @@ sinks:
 async fn test_event_time_metrics_misconfigured_column_logs_once_and_skips() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 5u64;
@@ -1118,18 +1191,12 @@ sinks:
 async fn test_event_time_metrics_across_source_transform_and_sink() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 5u64;
@@ -1259,18 +1326,12 @@ sinks:
 async fn test_yaml_telemetry_labels_appear_on_emitted_metrics() {
     let ctx = match setup_with_prometheus().await {
         Ok(ctx) => ctx,
-        Err(e) => {
-            eprintln!("Skipping test - could not create context: {}", e);
-            return;
-        }
+        Err(e) => panic!("Failed to create test context: {}", e),
     };
 
     let prometheus = match &ctx.prometheus {
         Some(p) => p,
-        None => {
-            eprintln!("Skipping test - Prometheus not configured");
-            return;
-        }
+        None => panic!("Prometheus should be available"),
     };
 
     let total_records = 10u64;

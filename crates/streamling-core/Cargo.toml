@@ -2,7 +2,7 @@
 name = "streamling-core"
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.91.0"
+rust-version = "1.96.0"
 description = "Core streaming execution engine for Streamling, built on Apache DataFusion."
 license-file.workspace = true
 repository.workspace = true
@@ -90,8 +90,15 @@ tonic.workspace = true
 paste.workspace = true
 
 [dev-dependencies]
-opentelemetry_sdk = { workspace = true, features = ["testing"] }
 rand.workspace = true
+# `experimental_metrics_custom_reader` exposes `ManualReader` + the `reader`
+# module so unit tests can install a collectable in-process meter provider and
+# read back emitted counters (e.g. `node_wait`). Test-only: enabling it here
+# does not affect the production build, which never compiles dev-dependencies.
+opentelemetry_sdk = { workspace = true, features = [
+    "experimental_metrics_custom_reader",
+    "testing",
+] }
 serial_test.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
