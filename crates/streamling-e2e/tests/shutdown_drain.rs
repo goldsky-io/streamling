@@ -595,13 +595,38 @@ async fn test_job_mode_sigterm_mid_range_exits_nonzero_and_resumes() {
         .await
         .expect("Failed to create offset table");
 
-    // One application id and one persistent state file across both runs:
-    // exactly what the Job controller's replacement pod sees.
+    // One application id and one persistent state table across both runs:
+    // exactly what the Job controller's replacement pod sees. Postgres rather
+    // than Sqlite so the test can see when run 1 has a cursor to resume from.
     let application_id = format!("job_sigterm_{}", ctx.test_id);
-    let state_path = std::env::temp_dir()
-        .join(format!("job_sigterm_state_{}.sqlite", ctx.test_id))
-        .to_string_lossy()
-        .into_owned();
+    let state_table = format!("job_sigterm_state_{}", ctx.test_id.replace('-', "_"));
+
+    // Pace run 1's sink so the scan cannot finish the range before the
+    // SIGTERM, however fast the runner: >= 100ms per 200-row batch puts the
+    // whole range minutes away. Created with the sink's own DDL so its
+    // `CREATE TABLE IF NOT EXISTS` keeps it, trigger included.
+    ctx.postgres
+        .execute(
+            "CREATE TABLE public.job_sigterm_run1 \
+             (block BIGINT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, \
+              timestamp BIGINT NOT NULL, PRIMARY KEY (id))",
+        )
+        .await
+        .expect("Failed to create run 1 sink table");
+    ctx.postgres
+        .execute(
+            "CREATE FUNCTION public.pace_job_sigterm_run1() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NULL; END; $$",
+        )
+        .await
+        .expect("Failed to create pacing function");
+    ctx.postgres
+        .execute(
+            "CREATE TRIGGER pace BEFORE INSERT ON public.job_sigterm_run1 \
+             FOR EACH STATEMENT EXECUTE FUNCTION public.pace_job_sigterm_run1()",
+        )
+        .await
+        .expect("Failed to attach pacing trigger");
     let pipeline_for = |table: &str| {
         format!(
             r#"
@@ -648,35 +673,46 @@ sinks:
             // across the range; resume granularity is one page.
             .env("STREAMLING__CLICKHOUSE_SOURCE__PAGE_SIZE", "1000")
             .env("STREAMLING__CLICKHOUSE_SOURCE__SORT_KEY_RANGE", "1000")
-            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Sqlite")
+            .env("STREAMLING__STATE_BACKEND__BACKEND_TYPE", "Postgres")
             .env(
-                "STREAMLING__STATE_BACKEND__SQLITE__DATABASE_PATH",
-                &state_path,
+                "STREAMLING__STATE_BACKEND__POSTGRES__HOST",
+                &ctx.postgres.host,
+            )
+            .env(
+                "STREAMLING__STATE_BACKEND__POSTGRES__PORT",
+                ctx.postgres.port.to_string(),
+            )
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__USER", "postgres")
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__PASSWORD", "postgres")
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__DB", &ctx.pg_database)
+            .env("STREAMLING__STATE_BACKEND__POSTGRES__SSLMODE", "disable")
+            .env(
+                "STREAMLING__STATE_BACKEND__POSTGRES__STATE_TABLE_NAME",
+                &state_table,
             )
     };
 
-    // Run 1: signal mid-range, 3s after rows first land, so at least one
-    // periodic checkpoint (1s interval) has finalized a scan cursor for run 2
-    // to resume from.
-    let rows_landed = async {
-        loop {
-            let landed = ctx
-                .postgres
-                .count("SELECT COUNT(*) FROM public.job_sigterm_run1")
-                .await
-                .is_ok_and(|n| n > 0);
-            if landed {
-                break;
-            }
+    // Run 1: signal once a finalized checkpoint has persisted a scan cursor
+    // past the start, so run 2 has something to resume from.
+    let cursor_persisted = format!(
+        "SELECT COUNT(*) FROM streamling.\"{state_table}\" \
+         WHERE key LIKE 'clickhouse_source:%' AND (data #>> '{{args,0,value}}')::numeric > 0"
+    );
+    let resumable = async {
+        while !ctx
+            .postgres
+            .count(&cursor_persisted)
+            .await
+            .is_ok_and(|n| n > 0)
+        {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     };
     let (status, _stderr) = ctx
         .run_pipeline_with_sigterm_when(
             &pipeline_for("job_sigterm_run1"),
             opts(),
-            rows_landed,
+            resumable,
             std::time::Duration::from_secs(30),
         )
         .await
