@@ -151,11 +151,21 @@ async fn ms(ctx: &TestContext, query: String) -> u64 {
         .unwrap_or(0)
 }
 
-/// Final `node_wait` totals of this run for a linear chain of `nodes`, once
-/// the last export landed.
+/// Final `node_wait` totals of this run for a linear chain of `nodes`.
 async fn snapshot(ctx: &TestContext, nodes: &[&'static str]) -> Snapshot {
-    // The exporter pushes every second; give the final push time to land.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // The binary flushes its exporter on exit; wait only for ingestion.
+    prometheus(ctx)
+        .wait_for_metric_at_least(
+            &format!(
+                "count(streamling_node_wait_milliseconds_total{{instance=\"{}\"}})",
+                ctx.test_id
+            ),
+            1,
+            30,
+            250,
+        )
+        .await
+        .expect("no node_wait series exported for this run");
     let id = Some(ctx.test_id.as_str());
     let mut snapshot = Snapshot::default();
     for &node in nodes {
@@ -684,15 +694,18 @@ async fn continuous_file_source_idle_polls_are_starved() {
     assert!(s.starved("f_src") > s.busy("f_src"), "{s:?}");
     assert!(s.starved("f_sink") > s.busy("f_sink"), "{s:?}");
     // Each idle poll emits an empty heartbeat batch.
-    let empty = ms(
-        &ctx,
-        format!(
-            "streamling_node_empty_batches_total{{id=\"f_src\",instance=\"{}\"}}",
-            ctx.test_id
-        ),
-    )
-    .await;
-    assert!(empty >= 1, "f_src empty batches: {empty}");
+    prometheus(&ctx)
+        .wait_for_metric_at_least(
+            &format!(
+                "sum(streamling_node_empty_batches_total{{id=\"f_src\",instance=\"{}\"}})",
+                ctx.test_id
+            ),
+            1,
+            30,
+            250,
+        )
+        .await
+        .expect("no f_src empty batches exported for this run");
 }
 
 // ============================================================================
