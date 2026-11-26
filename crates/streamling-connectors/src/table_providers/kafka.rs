@@ -1643,7 +1643,8 @@ async fn owned_partition_lags(
         }) {
             Ok((_, high_watermark)) => high_watermark,
             Err(e) => {
-                error!(
+                // Only this partition's lag metric is lost; the pipeline runs on.
+                warn!(
                     "Failed to fetch watermarks for topic: {}, partition {}: {:?}; lag metric will not be reported",
                     topic, partition, e
                 );
