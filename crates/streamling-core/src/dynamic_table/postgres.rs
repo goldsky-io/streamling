@@ -28,8 +28,17 @@ const IDENTIFIER_PATTERN: &str = r"^[A-Za-z_][A-Za-z0-9_]*$";
 const CACHE_WRITE_LOCK_QUERY: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 const CACHE_LOAD_CURSOR_NAME: &str = "streamling_dynamic_table_cache";
 const CACHE_LOAD_PAGE_SIZE: usize = 1_000;
-/// Statement timeout for each individual database query (30 seconds)
+/// Server-side `statement_timeout` configured on each Postgres connection (30 seconds).
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Client-side ceiling per Postgres round trip (2x `STATEMENT_TIMEOUT`).
+///
+/// Server-side `statement_timeout` cannot fire when a middlebox silently drops
+/// the TCP flow mid-query, so each round trip is additionally bounded
+/// client-side. Setting the client bound to 2x the server timeout (matching
+/// `PostgresSinkConfig::client_statement_timeout`) lets Postgres's real `57014`
+/// error arrive first whenever the server is reachable, avoiding unnecessary
+/// connection teardowns on healthy slow queries.
+const CLIENT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(STATEMENT_TIMEOUT.as_secs() * 2);
 
 /// PostgreSQL error codes that indicate a transient infrastructure failure
 /// rather than a permanent configuration problem: connection exceptions
@@ -390,7 +399,7 @@ pub struct PostgresDynamicTableBackend {
     /// Millis since `created_at` at the last freshness check.
     last_freshness_check_ms: AtomicU64,
     /// Client-side ceiling on each individual database round trip.
-    statement_timeout: Duration,
+    client_statement_timeout: Duration,
 }
 
 impl PostgresDynamicTableBackend {
@@ -429,13 +438,13 @@ impl PostgresDynamicTableBackend {
             cache_refresh_debounce_ms,
             created_at: Instant::now(),
             last_freshness_check_ms: AtomicU64::new(0),
-            statement_timeout: STATEMENT_TIMEOUT,
+            client_statement_timeout: CLIENT_STATEMENT_TIMEOUT,
         }
     }
 
     #[cfg(test)]
-    fn with_statement_timeout(mut self, timeout: Duration) -> Self {
-        self.statement_timeout = timeout;
+    fn with_client_statement_timeout(mut self, timeout: Duration) -> Self {
+        self.client_statement_timeout = timeout;
         self
     }
 
@@ -452,7 +461,7 @@ impl PostgresDynamicTableBackend {
         .into();
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable latest_update ({})", self.full_table_name);
-        let timeout = self.statement_timeout;
+        let timeout = self.client_statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -524,7 +533,7 @@ impl PostgresDynamicTableBackend {
         let updated_since = updated_since.map(str::to_owned);
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable load_cache ({})", self.full_table_name);
-        let timeout = self.statement_timeout;
+        let timeout = self.client_statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -746,7 +755,7 @@ impl PostgresDynamicTableBackend {
             r#"SELECT MAX("{}")::TEXT FROM {} WHERE "{}" >= CURRENT_TIMESTAMP AND FALSE"#,
             self.time_column_name, self.full_table_name, self.time_column_name
         );
-        let timeout = self.statement_timeout;
+        let timeout = self.client_statement_timeout;
         let mut conn = pool.acquire().await.map_err(|e| {
             let err = classify_sqlx_error(
                 &format!(
@@ -811,7 +820,7 @@ impl PostgresDynamicTableBackend {
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let column_name: Arc<str> = Arc::from(self.column_name.as_str());
         let operation_name = format!("DynamicTable contains_batch ({})", self.full_table_name);
-        let timeout = self.statement_timeout;
+        let timeout = self.client_statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -894,7 +903,7 @@ impl PostgresDynamicTableBackend {
         let time_column_name: Arc<str> = Arc::from(self.time_column_name.as_str());
         let serialize_write = self.cache.is_some();
         let operation_name = format!("DynamicTable append_batch ({})", self.full_table_name);
-        let timeout = self.statement_timeout;
+        let timeout = self.client_statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -1059,15 +1068,15 @@ impl PostgresDynamicTableBackend {
             })?;
 
         // Set statement_timeout via SQL after connect (compatible with Neon and other pooled providers)
-        let timeout = self.statement_timeout;
-        let statement_timeout_ms = timeout.as_millis();
+        let statement_timeout_ms = STATEMENT_TIMEOUT.as_millis();
+        let timeout = self.client_statement_timeout;
         let pool_options: PoolOptions<Postgres> = PoolOptions::default()
             .max_connections(
                 self.config
                     .max_connections
                     .unwrap_or(DEFAULT_MAX_CONNECTIONS),
             )
-            .acquire_timeout(timeout)
+            .acquire_timeout(STATEMENT_TIMEOUT)
             .after_connect(move |conn: &mut sqlx::PgConnection, _meta| {
                 Box::pin(async move {
                     conn.execute(
@@ -1961,6 +1970,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_statement_timeout_exceeds_server_statement_timeout() {
+        assert!(CLIENT_STATEMENT_TIMEOUT > STATEMENT_TIMEOUT);
+        assert_eq!(CLIENT_STATEMENT_TIMEOUT, STATEMENT_TIMEOUT * 2);
+    }
+
     #[tokio::test]
     async fn silent_postgres_does_not_hang_contains_batch() {
         let (pool, connections) = silent_pool().await;
@@ -1978,7 +1993,7 @@ mod tests {
             )
             .await
             .expect("backend")
-            .with_statement_timeout(Duration::from_millis(150));
+            .with_client_statement_timeout(Duration::from_millis(150));
 
         assert_retries_fresh_connections_on_silent_server(&connections, 3, || {
             backend.contains_batch(pool.clone(), vec![(0, "0xabc".to_string())])
@@ -2003,7 +2018,7 @@ mod tests {
             )
             .await
             .expect("backend")
-            .with_statement_timeout(Duration::from_millis(150));
+            .with_client_statement_timeout(Duration::from_millis(150));
 
         assert_retries_fresh_connections_on_silent_server(&connections, 3, || {
             backend.latest_update(pool.clone())
@@ -2027,7 +2042,7 @@ mod tests {
             .create_backend("silent_append".to_string(), None, None, None, 1000, 0, None)
             .await
             .expect("backend")
-            .with_statement_timeout(Duration::from_millis(150));
+            .with_client_statement_timeout(Duration::from_millis(150));
 
         assert_retries_fresh_connections_on_silent_server(&connections, 3, || {
             uncached.append_batch(pool.clone(), vec!["0xabc".to_string()])
@@ -2050,7 +2065,7 @@ mod tests {
             )
             .await
             .expect("backend")
-            .with_statement_timeout(Duration::from_millis(150));
+            .with_client_statement_timeout(Duration::from_millis(150));
 
         assert_retries_fresh_connections_on_silent_server(&connections2, 3, || {
             cached.append_batch(pool2.clone(), vec!["0xabc".to_string()])
@@ -2075,7 +2090,7 @@ mod tests {
             )
             .await
             .expect("backend")
-            .with_statement_timeout(Duration::from_millis(150));
+            .with_client_statement_timeout(Duration::from_millis(150));
 
         // Three sequential calls on a 2-connection pool must each time out as a
         // retriable Connection error and detach the dead socket so attempt 3
