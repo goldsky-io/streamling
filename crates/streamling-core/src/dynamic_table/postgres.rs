@@ -3,7 +3,9 @@ use crate::dynamic_table::{DynamicTableBackend, DynamicTableBackendError, extrac
 use crate::error::Result as StreamlingResult;
 use crate::error::ResultExt;
 use crate::error::StreamlingError;
-use crate::retry::{retry_forever_with_backoff_until_cancelled_returning, retry_if_retriable};
+use crate::retry::{
+    retry_forever_with_backoff_until_cancelled_returning, retry_if_retriable_until_cancelled,
+};
 use crate::streamling_user_err;
 use async_trait::async_trait;
 use datafusion::arrow::array::builder::{BooleanBuilder, LargeStringBuilder};
@@ -28,7 +30,8 @@ const IDENTIFIER_PATTERN: &str = r"^[A-Za-z_][A-Za-z0-9_]*$";
 const CACHE_WRITE_LOCK_QUERY: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 const CACHE_LOAD_CURSOR_NAME: &str = "streamling_dynamic_table_cache";
 const CACHE_LOAD_PAGE_SIZE: usize = 1_000;
-/// Server-side `statement_timeout` configured on each Postgres connection (30 seconds).
+/// Server-side `statement_timeout` and `idle_in_transaction_session_timeout`
+/// configured on each Postgres connection (30 seconds).
 const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Client-side ceiling per Postgres round trip (2x `STATEMENT_TIMEOUT`).
 ///
@@ -118,6 +121,22 @@ fn finish_bounded<T>(
     }
 }
 
+/// Init-path counterpart of [`finish_bounded`]: detach the dead connection and
+/// return a retriable `Connection` error naming `subject`.
+fn init_timed_out(
+    conn: sqlx::pool::PoolConnection<Postgres>,
+    step: &str,
+    subject: &str,
+    timeout: Duration,
+) -> DynamicTableBackendError {
+    drop(conn.detach());
+    let err = DynamicTableBackendError::Connection(format!(
+        "{step} for {subject} did not complete within {timeout:?}; discarded the connection"
+    ));
+    error!("{}", err);
+    err
+}
+
 /// PostgreSQL factory that maintains the connection pool and schema information
 pub struct PostgresDynamicTableBackendFactory {
     pool: Arc<OnceCell<Arc<PgPool>>>,
@@ -196,15 +215,12 @@ impl PostgresDynamicTableBackendFactory {
                 );
                 Ok(())
             }
-            Err(BoundedStepError::Timeout(step)) => {
-                drop(conn.detach());
-                let err = DynamicTableBackendError::Connection(format!(
-                    "{step} for schema {dt_schema_name} did not complete within {timeout:?}; \
-                     discarded the connection"
-                ));
-                error!("{}", err);
-                Err(err)
-            }
+            Err(BoundedStepError::Timeout(step)) => Err(init_timed_out(
+                conn,
+                step,
+                &format!("schema {dt_schema_name}"),
+                timeout,
+            )),
             Err(BoundedStepError::Sqlx(step, e)) => {
                 let err = classify_sqlx_error(step, dt_schema_name, &e);
                 error!("{}", err);
@@ -250,15 +266,12 @@ impl PostgresDynamicTableBackendFactory {
                 );
                 Ok(true)
             }
-            Err(BoundedStepError::Timeout(step)) => {
-                drop(conn.detach());
-                let err = DynamicTableBackendError::Connection(format!(
-                    "{step} for table {full_table_name} did not complete within {timeout:?}; \
-                     discarded the connection"
-                ));
-                error!("{}", err);
-                Err(err)
-            }
+            Err(BoundedStepError::Timeout(step)) => Err(init_timed_out(
+                conn,
+                step,
+                &format!("table {full_table_name}"),
+                timeout,
+            )),
             Err(BoundedStepError::Sqlx(step, e)) => {
                 let error_msg = e.to_string().to_lowercase();
                 // Check if error is about missing column (table exists but column doesn't)
@@ -776,16 +789,15 @@ impl PostgresDynamicTableBackend {
         .await
         {
             Ok(_) => Ok(()),
-            Err(BoundedStepError::Timeout(_)) => {
-                drop(conn.detach());
-                let err = DynamicTableBackendError::Connection(format!(
-                    "Failed to validate cache time column '{}' for table {}: \
-                     did not complete within {timeout:?}; discarded the connection",
-                    self.time_column_name, self.full_table_name
-                ));
-                error!("{}", err);
-                Err(err)
-            }
+            Err(BoundedStepError::Timeout(_)) => Err(init_timed_out(
+                conn,
+                &format!(
+                    "Failed to validate cache time column '{}'",
+                    self.time_column_name
+                ),
+                &format!("table {}", self.full_table_name),
+                timeout,
+            )),
             Err(BoundedStepError::Sqlx(_, e)) => {
                 let err = classify_sqlx_error(
                     &format!(
@@ -1016,14 +1028,22 @@ impl PostgresDynamicTableBackend {
     /// Ensure the pool is initialized and table exists. Called lazily on first use.
     ///
     /// The whole init attempt (connect + table/index setup + cache validation)
-    /// is retried forever with backoff while errors are retriable
-    /// (`Connection`: failed connects, transient Postgres outages) so a
-    /// temporarily unavailable database never fails the batch/pipeline.
-    /// Permanent configuration errors (`Initialization`: invalid identifiers,
-    /// missing column, non-orderable time column) fail fast. Each attempt is
-    /// bounded: sqlx's acquire timeout bounds connect, the statement timeout
-    /// bounds every query.
+    /// is retried with backoff while errors are retriable (`Connection`:
+    /// failed connects, transient Postgres outages) until shutdown is
+    /// requested, so a temporarily unavailable database never fails the
+    /// batch/pipeline and never blocks a drain. Permanent configuration errors
+    /// (`Initialization`: invalid identifiers, missing column, non-orderable
+    /// time column) fail fast. Each attempt is bounded: sqlx's acquire timeout
+    /// bounds connect, the client deadline bounds every query.
     async fn get_pool(&self) -> Result<Arc<PgPool>, DynamicTableBackendError> {
+        self.get_pool_until_cancelled(&mut crate::shutdown::subscribe())
+            .await
+    }
+
+    async fn get_pool_until_cancelled(
+        &self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Arc<PgPool>, DynamicTableBackendError> {
         debug!(
             "Initializing PostgreSQL connection pool for dynamic table: {}",
             self.full_table_name
@@ -1031,9 +1051,10 @@ impl PostgresDynamicTableBackend {
         self.pool
             .get_or_try_init(|| async {
                 let operation_name = format!("DynamicTable init pool ({})", self.full_table_name);
-                retry_if_retriable(
+                retry_if_retriable_until_cancelled(
                     || async { self.try_init_pool().await.map_err(StreamlingError::from) },
                     &operation_name,
+                    shutdown,
                 )
                 .await
                 .map_err(|e| {
@@ -1067,8 +1088,14 @@ impl PostgresDynamicTableBackend {
                 err
             })?;
 
-        // Set statement_timeout via SQL after connect (compatible with Neon and other pooled providers)
-        let statement_timeout_ms = STATEMENT_TIMEOUT.as_millis();
+        // Session settings via SQL after connect (compatible with Neon and other
+        // pooled providers). The idle-transaction timeout makes the server end a
+        // transaction whose client vanished (client deadline fired on a dead
+        // flow), releasing its advisory lock and snapshot.
+        let session_setup = format!(
+            "SET statement_timeout = {ms}; SET idle_in_transaction_session_timeout = {ms}",
+            ms = STATEMENT_TIMEOUT.as_millis()
+        );
         let timeout = self.client_statement_timeout;
         let pool_options: PoolOptions<Postgres> = PoolOptions::default()
             .max_connections(
@@ -1076,13 +1103,11 @@ impl PostgresDynamicTableBackend {
                     .max_connections
                     .unwrap_or(DEFAULT_MAX_CONNECTIONS),
             )
-            .acquire_timeout(STATEMENT_TIMEOUT)
+            .acquire_timeout(timeout)
             .after_connect(move |conn: &mut sqlx::PgConnection, _meta| {
+                let session_setup = session_setup.clone();
                 Box::pin(async move {
-                    conn.execute(
-                        format!("SET statement_timeout = {}", statement_timeout_ms).as_str(),
-                    )
-                    .await?;
+                    conn.execute(session_setup.as_str()).await?;
                     Ok(())
                 })
             });
@@ -1196,17 +1221,19 @@ impl PostgresDynamicTableBackend {
             match create_result {
                 Ok(()) => {}
                 Err(BoundedStepError::Timeout(step)) => {
-                    drop(conn.detach());
-                    let err = DynamicTableBackendError::Connection(format!(
-                        "{step} for table {} did not complete within {timeout:?}; \
-                         discarded the connection",
-                        self.full_table_name
+                    return Err(init_timed_out(
+                        conn,
+                        &format!("{step} (index {index_name})"),
+                        &format!("table {}", self.full_table_name),
+                        timeout,
                     ));
-                    error!("{}", err);
-                    return Err(err);
                 }
                 Err(BoundedStepError::Sqlx(step, e)) => {
-                    let err = classify_sqlx_error(step, &self.full_table_name, &e);
+                    let err = classify_sqlx_error(
+                        &format!("{step} (index {index_name})"),
+                        &self.full_table_name,
+                        &e,
+                    );
                     error!("{}", err);
                     return Err(err);
                 }
@@ -1919,6 +1946,51 @@ mod tests {
     fn deduplicate_value_indices_empty_input() {
         let result = deduplicate_value_indices(vec![]);
         assert!(result.is_empty());
+    }
+
+    /// Pool init against a silent server must (a) ask the server to end
+    /// orphaned transactions, so a dropped client cannot leave the
+    /// cached-write advisory lock held until server TCP keepalive, and (b) stop
+    /// retrying once shutdown is requested instead of looping forever.
+    #[tokio::test]
+    async fn silent_postgres_pool_init_sets_idle_tx_timeout_and_honors_shutdown() {
+        let (addr, _connections, received) =
+            crate::utils::pg::spawn_silent_postgres_recording().await;
+        let mut config = postgres_config(true);
+        config.host = addr.ip().to_string();
+        config.port = addr.port();
+        let factory = PostgresDynamicTableBackendFactory::new(config).expect("factory");
+        let backend = factory
+            .create_backend(
+                "silent_pool_init".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend")
+            .with_client_statement_timeout(Duration::from_millis(150));
+
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(true);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.get_pool_until_cancelled(&mut shutdown),
+        )
+        .await
+        .expect("pool init must stop retrying once shutdown is requested");
+        assert!(
+            matches!(result, Err(DynamicTableBackendError::Connection(_))),
+            "silent server must surface as a retriable Connection error, got {result:?}"
+        );
+
+        let received = String::from_utf8_lossy(&received.lock().expect("lock")).into_owned();
+        assert!(
+            received.contains("idle_in_transaction_session_timeout"),
+            "session setup must bound idle transactions server-side, sent: {received:?}"
+        );
     }
 
     /// Connect a 2-connection lazy pool to a silent fake Postgres server that

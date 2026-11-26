@@ -684,6 +684,18 @@ pub fn override_schema_for_postgres_insert(source_schema: &SchemaRef) -> Schema 
 #[cfg(test)]
 pub(crate) async fn spawn_silent_postgres()
 -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let (addr, connections, _received) = spawn_silent_postgres_recording().await;
+    (addr, connections)
+}
+
+/// [`spawn_silent_postgres`], also returning every byte the server received
+/// after the startup handshake (e.g. session setup SQL from `after_connect`).
+#[cfg(test)]
+pub(crate) async fn spawn_silent_postgres_recording() -> (
+    std::net::SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<u8>>>,
+) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -692,6 +704,8 @@ pub(crate) async fn spawn_silent_postgres()
     let addr = listener.local_addr().expect("local_addr");
     let connections = Arc::new(AtomicUsize::new(0));
     let accepted = connections.clone();
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = received.clone();
 
     // Sanctioned: test-only fake server; dies with the test runtime.
     #[allow(clippy::disallowed_methods)]
@@ -701,6 +715,7 @@ pub(crate) async fn spawn_silent_postgres()
                 break;
             };
             accepted.fetch_add(1, Ordering::SeqCst);
+            let recorder = recorder.clone();
 
             #[allow(clippy::disallowed_methods)]
             tokio::spawn(async move {
@@ -745,17 +760,17 @@ pub(crate) async fn spawn_silent_postgres()
                 // Handshake complete. Play dead: keep draining client bytes
                 // so writes succeed, but never send another byte back.
                 let mut sink_buf = [0u8; 4096];
-                while socket
-                    .read(&mut sink_buf)
-                    .await
-                    .map(|n| n > 0)
-                    .unwrap_or(false)
-                {}
+                while let Ok(n @ 1..) = socket.read(&mut sink_buf).await {
+                    recorder
+                        .lock()
+                        .expect("recorder lock")
+                        .extend_from_slice(&sink_buf[..n]);
+                }
             });
         }
     });
 
-    (addr, connections)
+    (addr, connections, received)
 }
 
 #[cfg(test)]
