@@ -676,6 +676,88 @@ pub fn override_schema_for_postgres_insert(source_schema: &SchemaRef) -> Schema 
     Schema::new(fields)
 }
 
+/// Minimal fake PostgreSQL server: completes the startup handshake, then
+/// never responds to anything else while still reading (and ACKing) the
+/// client's bytes. This models a peer that died silently mid-connection —
+/// the client's write succeeds and its read waits forever, which is
+/// exactly the state that used to hang the sink with no logs.
+#[cfg(test)]
+pub(crate) async fn spawn_silent_postgres()
+-> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = connections.clone();
+
+    // Sanctioned: test-only fake server; dies with the test runtime.
+    #[allow(clippy::disallowed_methods)]
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+
+            #[allow(clippy::disallowed_methods)]
+            tokio::spawn(async move {
+                // Read the client's StartupMessage (length-prefixed, no type byte).
+                let mut len_buf = [0u8; 4];
+                if socket.read_exact(&mut len_buf).await.is_err() {
+                    return;
+                }
+                let len = (u32::from_be_bytes(len_buf) as usize).saturating_sub(4);
+                let mut body = vec![0u8; len];
+                if socket.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+
+                let mut reply: Vec<u8> = Vec::new();
+                // AuthenticationOk
+                reply.extend([b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
+                // ParameterStatus messages the client parses during connect
+                for (key, value) in [
+                    ("server_version", "14.0"),
+                    ("client_encoding", "UTF8"),
+                    ("DateStyle", "ISO, MDY"),
+                ] {
+                    let payload_len = 4 + key.len() + 1 + value.len() + 1;
+                    reply.push(b'S');
+                    reply.extend((payload_len as u32).to_be_bytes());
+                    reply.extend(key.as_bytes());
+                    reply.push(0);
+                    reply.extend(value.as_bytes());
+                    reply.push(0);
+                }
+                // BackendKeyData
+                reply.extend([b'K', 0, 0, 0, 12]);
+                reply.extend(1234u32.to_be_bytes());
+                reply.extend(5678u32.to_be_bytes());
+                // ReadyForQuery (idle)
+                reply.extend([b'Z', 0, 0, 0, 5, b'I']);
+                if socket.write_all(&reply).await.is_err() {
+                    return;
+                }
+
+                // Handshake complete. Play dead: keep draining client bytes
+                // so writes succeed, but never send another byte back.
+                let mut sink_buf = [0u8; 4096];
+                while socket
+                    .read(&mut sink_buf)
+                    .await
+                    .map(|n| n > 0)
+                    .unwrap_or(false)
+                {}
+            });
+        }
+    });
+
+    (addr, connections)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,86 +978,7 @@ mod tests {
     }
 
     use sqlx::postgres::PgPoolOptions;
-    use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    /// Minimal fake PostgreSQL server: completes the startup handshake, then
-    /// never responds to anything else while still reading (and ACKing) the
-    /// client's bytes. This models a peer that died silently mid-connection —
-    /// the client's write succeeds and its read waits forever, which is
-    /// exactly the state that used to hang the sink with no logs.
-    async fn spawn_silent_postgres() -> (SocketAddr, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-        let connections = Arc::new(AtomicUsize::new(0));
-        let accepted = connections.clone();
-
-        // Sanctioned: test-only fake server; dies with the test runtime.
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                accepted.fetch_add(1, Ordering::SeqCst);
-
-                #[allow(clippy::disallowed_methods)]
-                tokio::spawn(async move {
-                    // Read the client's StartupMessage (length-prefixed, no type byte).
-                    let mut len_buf = [0u8; 4];
-                    if socket.read_exact(&mut len_buf).await.is_err() {
-                        return;
-                    }
-                    let len = (u32::from_be_bytes(len_buf) as usize).saturating_sub(4);
-                    let mut body = vec![0u8; len];
-                    if socket.read_exact(&mut body).await.is_err() {
-                        return;
-                    }
-
-                    let mut reply: Vec<u8> = Vec::new();
-                    // AuthenticationOk
-                    reply.extend([b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
-                    // ParameterStatus messages the client parses during connect
-                    for (key, value) in [
-                        ("server_version", "14.0"),
-                        ("client_encoding", "UTF8"),
-                        ("DateStyle", "ISO, MDY"),
-                    ] {
-                        let payload_len = 4 + key.len() + 1 + value.len() + 1;
-                        reply.push(b'S');
-                        reply.extend((payload_len as u32).to_be_bytes());
-                        reply.extend(key.as_bytes());
-                        reply.push(0);
-                        reply.extend(value.as_bytes());
-                        reply.push(0);
-                    }
-                    // BackendKeyData
-                    reply.extend([b'K', 0, 0, 0, 12]);
-                    reply.extend(1234u32.to_be_bytes());
-                    reply.extend(5678u32.to_be_bytes());
-                    // ReadyForQuery (idle)
-                    reply.extend([b'Z', 0, 0, 0, 5, b'I']);
-                    if socket.write_all(&reply).await.is_err() {
-                        return;
-                    }
-
-                    // Handshake complete. Play dead: keep draining client bytes
-                    // so writes succeed, but never send another byte back.
-                    let mut sink_buf = [0u8; 4096];
-                    while socket
-                        .read(&mut sink_buf)
-                        .await
-                        .map(|n| n > 0)
-                        .unwrap_or(false)
-                    {}
-                });
-            }
-        });
-
-        (addr, connections)
-    }
+    use std::sync::atomic::Ordering;
 
     /// Reproduces the silent-hang bug: without the client-side bound in
     /// `execute_bounded`, executing a statement against a peer that stopped

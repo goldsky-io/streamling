@@ -12,7 +12,7 @@ use futures::future::join_all;
 use regex::Regex;
 use sqlx::pool::PoolOptions;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{Executor, PgPool, Postgres};
+use sqlx::{Connection as _, Executor, PgPool, Postgres};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -64,6 +64,51 @@ fn classify_sqlx_error(operation: &str, table: &str, e: &sqlx::Error) -> Dynamic
     }
 }
 
+enum BoundedStepError {
+    Timeout(&'static str),
+    Sqlx(&'static str, sqlx::Error),
+}
+
+/// Run one Postgres round trip under a client-side deadline. Server-side
+/// `statement_timeout` cannot fire when the peer or a proxy silently drops the
+/// TCP flow mid-query, and sqlx exposes no TCP keepalive to detect it.
+async fn bounded_step<T>(
+    timeout: Duration,
+    step: &'static str,
+    fut: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, BoundedStepError> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(BoundedStepError::Sqlx(step, e)),
+        Err(_elapsed) => Err(BoundedStepError::Timeout(step)),
+    }
+}
+
+/// Complete a bounded operation on a checked-out connection: on timeout,
+/// detach and drop the connection so the dead socket is closed synchronously
+/// (releasing its pool permit immediately instead of hanging in a background
+/// rollback or return-to-pool ping) and return a retriable error.
+fn finish_bounded<T>(
+    conn: sqlx::pool::PoolConnection<Postgres>,
+    result: Result<T, BoundedStepError>,
+    timeout: Duration,
+    full_table_name: &str,
+) -> StreamlingResult<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(BoundedStepError::Timeout(step)) => {
+            drop(conn.detach());
+            Err(StreamlingError::retriable(format!(
+                "{step} for table {full_table_name} did not complete within {timeout:?}; \
+                 discarded the connection and will retry on a fresh one"
+            )))
+        }
+        Err(BoundedStepError::Sqlx(step, e)) => {
+            Err(e).streamling_with_context(|| format!("{step} for table {full_table_name}"))
+        }
+    }
+}
+
 /// PostgreSQL factory that maintains the connection pool and schema information
 pub struct PostgresDynamicTableBackendFactory {
     pool: Arc<OnceCell<Arc<PgPool>>>,
@@ -106,18 +151,25 @@ impl PostgresDynamicTableBackendFactory {
     async fn initialize_schema(
         pool: Arc<PgPool>,
         dt_schema_name: &str,
+        timeout: Duration,
     ) -> Result<(), DynamicTableBackendError> {
         trace!("Initializing schema: {}", dt_schema_name);
-        let result = sqlx::query(
-            format!(
-                r#"
+        let mut conn = pool.acquire().await.map_err(|e| {
+            let err = classify_sqlx_error("Failed to initialize schema", dt_schema_name, &e);
+            error!("{}", err);
+            err
+        })?;
+        let query = format!(
+            r#"
                 CREATE SCHEMA IF NOT EXISTS "{}";
             "#,
-                dt_schema_name
-            )
-            .as_str(),
+            dt_schema_name
+        );
+        let result = bounded_step(
+            timeout,
+            "Failed to initialize schema",
+            sqlx::query(&query).execute(&mut *conn),
         )
-        .execute(pool.as_ref())
         .await;
 
         match result {
@@ -128,25 +180,35 @@ impl PostgresDynamicTableBackendFactory {
             // See `creation_race_lost`: two backends initializing the same
             // schema concurrently is normal; the loser's duplicate error means
             // the schema exists.
-            Err(e) if crate::utils::pg::creation_race_lost(&e) => {
+            Err(BoundedStepError::Sqlx(_, e)) if crate::utils::pg::creation_race_lost(&e) => {
                 trace!(
                     "Schema {} already exists (lost a concurrent creation race)",
                     dt_schema_name
                 );
                 Ok(())
             }
-            Err(e) => {
-                let err = classify_sqlx_error("Failed to initialize schema", dt_schema_name, &e);
+            Err(BoundedStepError::Timeout(step)) => {
+                drop(conn.detach());
+                let err = DynamicTableBackendError::Connection(format!(
+                    "{step} for schema {dt_schema_name} did not complete within {timeout:?}; \
+                     discarded the connection"
+                ));
+                error!("{}", err);
+                Err(err)
+            }
+            Err(BoundedStepError::Sqlx(step, e)) => {
+                let err = classify_sqlx_error(step, dt_schema_name, &e);
                 error!("{}", err);
                 Err(err)
             }
         }
     }
 
-    pub async fn ensure_table_exists(
+    async fn ensure_table_exists(
         pool: Arc<PgPool>,
         full_table_name: String,
         column_name: &str,
+        timeout: Duration,
     ) -> Result<bool, DynamicTableBackendError> {
         // Try to query the column to check if table and column exist
         // We only check the value column since time_column has a default value
@@ -158,7 +220,17 @@ impl PostgresDynamicTableBackendFactory {
             "Checking table existence: {} with column: {}",
             full_table_name, column_name
         );
-        let result = sqlx::query(&check_query).execute(pool.as_ref()).await;
+        let mut conn = pool.acquire().await.map_err(|e| {
+            let err = classify_sqlx_error("Failed to check table existence", &full_table_name, &e);
+            error!("{}", err);
+            err
+        })?;
+        let result = bounded_step(
+            timeout,
+            "Failed to check table existence",
+            sqlx::query(&check_query).execute(&mut *conn),
+        )
+        .await;
 
         match result {
             Ok(_) => {
@@ -169,7 +241,16 @@ impl PostgresDynamicTableBackendFactory {
                 );
                 Ok(true)
             }
-            Err(e) => {
+            Err(BoundedStepError::Timeout(step)) => {
+                drop(conn.detach());
+                let err = DynamicTableBackendError::Connection(format!(
+                    "{step} for table {full_table_name} did not complete within {timeout:?}; \
+                     discarded the connection"
+                ));
+                error!("{}", err);
+                Err(err)
+            }
+            Err(BoundedStepError::Sqlx(step, e)) => {
                 let error_msg = e.to_string().to_lowercase();
                 // Check if error is about missing column (table exists but column doesn't)
                 // PostgreSQL error: "column \"column_name\" does not exist"
@@ -194,11 +275,7 @@ impl PostgresDynamicTableBackendFactory {
                     // Other errors: transient infrastructure failures are
                     // retried by get_pool; permanent ones (permissions, etc.)
                     // fail fast.
-                    let err = classify_sqlx_error(
-                        "Failed to check table existence",
-                        &full_table_name,
-                        &e,
-                    );
+                    let err = classify_sqlx_error(step, &full_table_name, &e);
                     error!("{}", err);
                     Err(err)
                 }
@@ -312,6 +389,8 @@ pub struct PostgresDynamicTableBackend {
     created_at: Instant,
     /// Millis since `created_at` at the last freshness check.
     last_freshness_check_ms: AtomicU64,
+    /// Client-side ceiling on each individual database round trip.
+    statement_timeout: Duration,
 }
 
 impl PostgresDynamicTableBackend {
@@ -350,7 +429,14 @@ impl PostgresDynamicTableBackend {
             cache_refresh_debounce_ms,
             created_at: Instant::now(),
             last_freshness_check_ms: AtomicU64::new(0),
+            statement_timeout: STATEMENT_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_statement_timeout(mut self, timeout: Duration) -> Self {
+        self.statement_timeout = timeout;
+        self
     }
 
     /// Retries with backoff until it succeeds or shutdown is requested (same drain
@@ -366,6 +452,7 @@ impl PostgresDynamicTableBackend {
         .into();
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable latest_update ({})", self.full_table_name);
+        let timeout = self.statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -374,12 +461,17 @@ impl PostgresDynamicTableBackend {
                 let query = query.clone();
                 let full_table_name = full_table_name.clone();
                 async move {
-                    sqlx::query_scalar::<_, Option<String>>(query.as_ref())
-                        .fetch_one(pool.as_ref())
-                        .await
-                        .streamling_with_context(|| {
-                            format!("failed to read latest update from table {full_table_name}")
-                        })
+                    let mut conn = pool.acquire().await.streamling_with_context(|| {
+                        format!("failed to acquire connection for table {full_table_name}")
+                    })?;
+                    let result = bounded_step(
+                        timeout,
+                        "failed to read latest update",
+                        sqlx::query_scalar::<_, Option<String>>(query.as_ref())
+                            .fetch_one(&mut *conn),
+                    )
+                    .await;
+                    finish_bounded(conn, result, timeout, full_table_name.as_ref())
                 }
             },
             &operation_name,
@@ -432,6 +524,7 @@ impl PostgresDynamicTableBackend {
         let updated_since = updated_since.map(str::to_owned);
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let operation_name = format!("DynamicTable load_cache ({})", self.full_table_name);
+        let timeout = self.statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -443,58 +536,69 @@ impl PostgresDynamicTableBackend {
                 let updated_since = updated_since.clone();
                 let full_table_name = full_table_name.clone();
                 async move {
-                    let mut transaction = pool.begin().await.streamling_with_context(|| {
-                        format!("failed to begin cache load for table {full_table_name}")
+                    let mut conn = pool.acquire().await.streamling_with_context(|| {
+                        format!("failed to acquire connection for table {full_table_name}")
                     })?;
-                    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-                        .execute(&mut *transaction)
-                        .await
-                        .streamling_with_context(|| {
-                            format!("failed to configure cache load for table {full_table_name}")
-                        })?;
+                    let result = async {
+                        let mut transaction =
+                            bounded_step(timeout, "failed to begin cache load", conn.begin())
+                                .await?;
+                        bounded_step(
+                            timeout,
+                            "failed to configure cache load",
+                            sqlx::query(
+                                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+                            )
+                            .execute(&mut *transaction),
+                        )
+                        .await?;
 
-                    let updated_at = sqlx::query_scalar::<_, Option<String>>(max_query.as_ref())
-                        .fetch_one(&mut *transaction)
-                        .await
-                        .streamling_with_context(|| {
-                            format!("failed to read cache version from table {full_table_name}")
-                        })?;
+                        let updated_at = bounded_step(
+                            timeout,
+                            "failed to read cache version",
+                            sqlx::query_scalar::<_, Option<String>>(max_query.as_ref())
+                                .fetch_one(&mut *transaction),
+                        )
+                        .await?;
 
-                    let cursor_query = sqlx::query(declare_cursor_query.as_ref());
-                    let cursor_query = if let Some(updated_since) = updated_since {
-                        cursor_query.bind(updated_since)
-                    } else {
-                        cursor_query
-                    };
-                    cursor_query
-                        .execute(&mut *transaction)
-                        .await
-                        .streamling_with_context(|| {
-                            format!("failed to open cache cursor for table {full_table_name}")
-                        })?;
+                        let cursor_query = sqlx::query(declare_cursor_query.as_ref());
+                        let cursor_query = if let Some(updated_since) = updated_since {
+                            cursor_query.bind(updated_since)
+                        } else {
+                            cursor_query
+                        };
+                        bounded_step(
+                            timeout,
+                            "failed to open cache cursor",
+                            cursor_query.execute(&mut *transaction),
+                        )
+                        .await?;
 
-                    let mut builder = LargeStringBuilder::new();
-                    let mut pages_loaded = 0;
-                    loop {
-                        let page: Vec<String> = sqlx::query_scalar(fetch_page_query.as_ref())
-                            .fetch_all(&mut *transaction)
-                            .await
-                            .streamling_with_context(|| {
-                                format!("failed to fetch cache page from table {full_table_name}")
-                            })?;
-                        if page.is_empty() {
-                            break;
+                        let mut builder = LargeStringBuilder::new();
+                        let mut pages_loaded = 0;
+                        loop {
+                            let page: Vec<String> = bounded_step(
+                                timeout,
+                                "failed to fetch cache page",
+                                sqlx::query_scalar(fetch_page_query.as_ref())
+                                    .fetch_all(&mut *transaction),
+                            )
+                            .await?;
+                            if page.is_empty() {
+                                break;
+                            }
+                            pages_loaded += 1;
+                            for value in page {
+                                builder.append_value(value);
+                            }
                         }
-                        pages_loaded += 1;
-                        for value in page {
-                            builder.append_value(value);
-                        }
+
+                        bounded_step(timeout, "failed to finish cache load", transaction.commit())
+                            .await?;
+                        Ok((updated_at, builder.finish(), pages_loaded))
                     }
-
-                    transaction.commit().await.streamling_with_context(|| {
-                        format!("failed to finish cache load for table {full_table_name}")
-                    })?;
-                    Ok((updated_at, builder.finish(), pages_loaded))
+                    .await;
+                    finish_bounded(conn, result, timeout, full_table_name.as_ref())
                 }
             },
             &operation_name,
@@ -642,7 +746,8 @@ impl PostgresDynamicTableBackend {
             r#"SELECT MAX("{}")::TEXT FROM {} WHERE "{}" >= CURRENT_TIMESTAMP AND FALSE"#,
             self.time_column_name, self.full_table_name, self.time_column_name
         );
-        sqlx::query(&query).execute(pool).await.map_err(|e| {
+        let timeout = self.statement_timeout;
+        let mut conn = pool.acquire().await.map_err(|e| {
             let err = classify_sqlx_error(
                 &format!(
                     "Failed to validate cache time column '{}'",
@@ -654,8 +759,37 @@ impl PostgresDynamicTableBackend {
             error!("{}", err);
             err
         })?;
-
-        Ok(())
+        match bounded_step(
+            timeout,
+            "Failed to validate cache time column",
+            sqlx::query(&query).execute(&mut *conn),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(BoundedStepError::Timeout(_)) => {
+                drop(conn.detach());
+                let err = DynamicTableBackendError::Connection(format!(
+                    "Failed to validate cache time column '{}' for table {}: \
+                     did not complete within {timeout:?}; discarded the connection",
+                    self.time_column_name, self.full_table_name
+                ));
+                error!("{}", err);
+                Err(err)
+            }
+            Err(BoundedStepError::Sqlx(_, e)) => {
+                let err = classify_sqlx_error(
+                    &format!(
+                        "Failed to validate cache time column '{}'",
+                        self.time_column_name
+                    ),
+                    &self.full_table_name,
+                    &e,
+                );
+                error!("{}", err);
+                Err(err)
+            }
+        }
     }
 
     /// Check if a batch of values exist in the table (internal method that doesn't split batches)
@@ -677,6 +811,7 @@ impl PostgresDynamicTableBackend {
         let full_table_name: Arc<str> = Arc::from(self.full_table_name.as_str());
         let column_name: Arc<str> = Arc::from(self.column_name.as_str());
         let operation_name = format!("DynamicTable contains_batch ({})", self.full_table_name);
+        let timeout = self.statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -708,15 +843,17 @@ impl PostgresDynamicTableBackend {
                         sqlx_query = sqlx_query.bind(value);
                     }
 
-                    let existing_values: Vec<String> = sqlx_query
-                        .fetch_all(pool.as_ref())
-                        .await
-                        .streamling_with_context(|| {
-                            format!(
-                                "failed to check if values exist in table {}",
-                                full_table_name
-                            )
-                        })?;
+                    let mut conn = pool.acquire().await.streamling_with_context(|| {
+                        format!("failed to acquire connection for table {full_table_name}")
+                    })?;
+                    let result = bounded_step(
+                        timeout,
+                        "failed to check if values exist",
+                        sqlx_query.fetch_all(&mut *conn),
+                    )
+                    .await;
+                    let existing_values: Vec<String> =
+                        finish_bounded(conn, result, timeout, full_table_name.as_ref())?;
 
                     Ok(existing_values
                         .into_iter()
@@ -757,6 +894,7 @@ impl PostgresDynamicTableBackend {
         let time_column_name: Arc<str> = Arc::from(self.time_column_name.as_str());
         let serialize_write = self.cache.is_some();
         let operation_name = format!("DynamicTable append_batch ({})", self.full_table_name);
+        let timeout = self.statement_timeout;
         let mut shutdown = crate::shutdown::subscribe();
 
         retry_forever_with_backoff_until_cancelled_returning(
@@ -806,42 +944,50 @@ impl PostgresDynamicTableBackend {
                         sqlx_query = sqlx_query.bind(value);
                     }
 
-                    if serialize_write {
-                        let mut transaction = pool.begin().await.streamling_with_context(|| {
-                            format!("failed to begin cached write to table {full_table_name}")
-                        })?;
+                    let mut conn = pool.acquire().await.streamling_with_context(|| {
+                        format!("failed to acquire connection for table {full_table_name}")
+                    })?;
+                    let result = async {
+                        if serialize_write {
+                            let mut transaction =
+                                bounded_step(timeout, "failed to begin cached write", conn.begin())
+                                    .await?;
 
-                        // Cached writes serialize per table; add a dedicated version row
-                        // only if write throughput makes this lock material.
-                        sqlx::query(CACHE_WRITE_LOCK_QUERY)
-                            .bind(full_table_name.as_ref())
-                            .execute(&mut *transaction)
-                            .await
-                            .streamling_with_context(|| {
-                                format!(
-                                    "failed to serialize cached writes to table {full_table_name}"
-                                )
-                            })?;
+                            // Cached writes serialize per table; add a dedicated version row
+                            // only if write throughput makes this lock material.
+                            bounded_step(
+                                timeout,
+                                "failed to serialize cached writes",
+                                sqlx::query(CACHE_WRITE_LOCK_QUERY)
+                                    .bind(full_table_name.as_ref())
+                                    .execute(&mut *transaction),
+                            )
+                            .await?;
 
-                        sqlx_query
-                            .execute(&mut *transaction)
-                            .await
-                            .streamling_with_context(|| {
-                                format!("failed to append values to table {full_table_name}")
-                            })?;
-                        transaction.commit().await.streamling_with_context(|| {
-                            format!("failed to commit cached write to table {full_table_name}")
-                        })?;
-                    } else {
-                        sqlx_query
-                            .execute(pool.as_ref())
-                            .await
-                            .streamling_with_context(|| {
-                                format!("failed to append values to table {full_table_name}")
-                            })?;
+                            bounded_step(
+                                timeout,
+                                "failed to append values",
+                                sqlx_query.execute(&mut *transaction),
+                            )
+                            .await?;
+                            bounded_step(
+                                timeout,
+                                "failed to commit cached write",
+                                transaction.commit(),
+                            )
+                            .await?;
+                        } else {
+                            bounded_step(
+                                timeout,
+                                "failed to append values",
+                                sqlx_query.execute(&mut *conn),
+                            )
+                            .await?;
+                        }
+                        Ok(())
                     }
-
-                    Ok(())
+                    .await;
+                    finish_bounded(conn, result, timeout, full_table_name.as_ref())
                 }
             },
             &operation_name,
@@ -913,13 +1059,15 @@ impl PostgresDynamicTableBackend {
             })?;
 
         // Set statement_timeout via SQL after connect (compatible with Neon and other pooled providers)
-        let statement_timeout_ms = STATEMENT_TIMEOUT.as_millis();
+        let timeout = self.statement_timeout;
+        let statement_timeout_ms = timeout.as_millis();
         let pool_options: PoolOptions<Postgres> = PoolOptions::default()
             .max_connections(
                 self.config
                     .max_connections
                     .unwrap_or(DEFAULT_MAX_CONNECTIONS),
             )
+            .acquire_timeout(timeout)
             .after_connect(move |conn: &mut sqlx::PgConnection, _meta| {
                 Box::pin(async move {
                     conn.execute(
@@ -954,6 +1102,7 @@ impl PostgresDynamicTableBackend {
             pool_arc.clone(),
             self.full_table_name.clone(),
             &self.column_name,
+            timeout,
         )
         .await
         .map_err(|e| {
@@ -977,6 +1126,7 @@ impl PostgresDynamicTableBackend {
             PostgresDynamicTableBackendFactory::initialize_schema(
                 pool_arc.clone(),
                 &self.dt_schema_name,
+                timeout,
             )
             .await?;
 
@@ -1004,39 +1154,54 @@ impl PostgresDynamicTableBackend {
                 index_name, self.full_table_name, self.time_column_name
             );
 
-            let mut transaction = pool_arc.begin().await.map_err(|e| {
+            let mut conn = pool_arc.acquire().await.map_err(|e| {
                 let err =
-                    classify_sqlx_error("Failed to begin transaction", &self.full_table_name, &e);
+                    classify_sqlx_error("Failed to acquire connection", &self.full_table_name, &e);
                 error!("{}", err);
                 err
             })?;
-            sqlx::query(&create_table_sql)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|e| {
-                    let err =
-                        classify_sqlx_error("Failed to create table", &self.full_table_name, &e);
+            let create_result = async {
+                let mut transaction =
+                    bounded_step(timeout, "Failed to begin transaction", conn.begin()).await?;
+                bounded_step(
+                    timeout,
+                    "Failed to create table",
+                    sqlx::query(&create_table_sql).execute(&mut *transaction),
+                )
+                .await?;
+                bounded_step(
+                    timeout,
+                    "Failed to create index",
+                    sqlx::query(&create_index_sql).execute(&mut *transaction),
+                )
+                .await?;
+                bounded_step(
+                    timeout,
+                    "Failed to commit transaction",
+                    transaction.commit(),
+                )
+                .await?;
+                Ok(())
+            }
+            .await;
+            match create_result {
+                Ok(()) => {}
+                Err(BoundedStepError::Timeout(step)) => {
+                    drop(conn.detach());
+                    let err = DynamicTableBackendError::Connection(format!(
+                        "{step} for table {} did not complete within {timeout:?}; \
+                         discarded the connection",
+                        self.full_table_name
+                    ));
                     error!("{}", err);
-                    err
-                })?;
-            sqlx::query(&create_index_sql)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|e| {
-                    let err = classify_sqlx_error(
-                        &format!("Failed to create index {index_name}"),
-                        &self.full_table_name,
-                        &e,
-                    );
+                    return Err(err);
+                }
+                Err(BoundedStepError::Sqlx(step, e)) => {
+                    let err = classify_sqlx_error(step, &self.full_table_name, &e);
                     error!("{}", err);
-                    err
-                })?;
-            transaction.commit().await.map_err(|e| {
-                let err =
-                    classify_sqlx_error("Failed to commit transaction", &self.full_table_name, &e);
-                error!("{}", err);
-                err
-            })?;
+                    return Err(err);
+                }
+            }
             info!("Successfully created table: {}", self.full_table_name);
         } else {
             debug!(
@@ -1745,5 +1910,218 @@ mod tests {
     fn deduplicate_value_indices_empty_input() {
         let result = deduplicate_value_indices(vec![]);
         assert!(result.is_empty());
+    }
+
+    /// Connect a 2-connection lazy pool to a silent fake Postgres server that
+    /// completes the startup handshake and then never answers any query.
+    async fn silent_pool() -> (Arc<PgPool>, Arc<std::sync::atomic::AtomicUsize>) {
+        let (addr, connections) = crate::utils::pg::spawn_silent_postgres().await;
+        let url = format!(
+            "postgres://user@{}:{}/db?sslmode=disable",
+            addr.ip(),
+            addr.port()
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy(&url)
+            .expect("lazy pool");
+        (Arc::new(pool), connections)
+    }
+
+    /// Drive a retry-forever backend call against a silent server and wait for
+    /// at least `min_connections` physical connections to be opened. With a
+    /// 2-connection pool, reaching 3 connections proves both that each stalled
+    /// attempt timed out client-side and that the dead connection was detached
+    /// (releasing its pool permit instead of leaking it into a hung rollback).
+    async fn assert_retries_fresh_connections_on_silent_server<F, Fut>(
+        connections: &Arc<std::sync::atomic::AtomicUsize>,
+        min_connections: usize,
+        op: F,
+    ) where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future,
+    {
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = op() => {}
+                _ = async {
+                    while connections.load(Ordering::SeqCst) < min_connections {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                } => {}
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok() && connections.load(Ordering::SeqCst) >= min_connections,
+            "expected at least {min_connections} fresh connections on a silent Postgres server \
+             within 5s, got {} (query hung instead of timing out and detaching the dead socket)",
+            connections.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_postgres_does_not_hang_contains_batch() {
+        let (pool, connections) = silent_pool().await;
+        let factory =
+            PostgresDynamicTableBackendFactory::new(postgres_config(false)).expect("factory");
+        let backend = factory
+            .create_backend(
+                "silent_contains".to_string(),
+                None,
+                None,
+                None,
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend")
+            .with_statement_timeout(Duration::from_millis(150));
+
+        assert_retries_fresh_connections_on_silent_server(&connections, 3, || {
+            backend.contains_batch(pool.clone(), vec![(0, "0xabc".to_string())])
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn silent_postgres_does_not_hang_cached_latest_update_and_load_cache() {
+        let (pool, connections) = silent_pool().await;
+        let factory =
+            PostgresDynamicTableBackendFactory::new(postgres_config(true)).expect("factory");
+        let backend = factory
+            .create_backend(
+                "silent_cache".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend")
+            .with_statement_timeout(Duration::from_millis(150));
+
+        assert_retries_fresh_connections_on_silent_server(&connections, 3, || {
+            backend.latest_update(pool.clone())
+        })
+        .await;
+
+        let (pool2, connections2) = silent_pool().await;
+        assert_retries_fresh_connections_on_silent_server(&connections2, 3, || {
+            backend.load_cache(pool2.clone(), None)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn silent_postgres_does_not_hang_append_batch() {
+        // Uncached single-statement path.
+        let (pool, connections) = silent_pool().await;
+        let factory =
+            PostgresDynamicTableBackendFactory::new(postgres_config(false)).expect("factory");
+        let uncached = factory
+            .create_backend("silent_append".to_string(), None, None, None, 1000, 0, None)
+            .await
+            .expect("backend")
+            .with_statement_timeout(Duration::from_millis(150));
+
+        assert_retries_fresh_connections_on_silent_server(&connections, 3, || {
+            uncached.append_batch(pool.clone(), vec!["0xabc".to_string()])
+        })
+        .await;
+
+        // Cached transactional path (BEGIN + advisory lock + INSERT + COMMIT).
+        let (pool2, connections2) = silent_pool().await;
+        let factory2 =
+            PostgresDynamicTableBackendFactory::new(postgres_config(true)).expect("factory");
+        let cached = factory2
+            .create_backend(
+                "silent_append_cached".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend")
+            .with_statement_timeout(Duration::from_millis(150));
+
+        assert_retries_fresh_connections_on_silent_server(&connections2, 3, || {
+            cached.append_batch(pool2.clone(), vec!["0xabc".to_string()])
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn silent_postgres_does_not_hang_init_checks() {
+        let (pool, connections) = silent_pool().await;
+        let factory =
+            PostgresDynamicTableBackendFactory::new(postgres_config(true)).expect("factory");
+        let backend = factory
+            .create_backend(
+                "silent_init".to_string(),
+                None,
+                None,
+                Some("updated_at".to_string()),
+                1000,
+                0,
+                None,
+            )
+            .await
+            .expect("backend")
+            .with_statement_timeout(Duration::from_millis(150));
+
+        // Three sequential calls on a 2-connection pool must each time out as a
+        // retriable Connection error and detach the dead socket so attempt 3
+        // still gets a fresh connection.
+        for attempt in 1..=3usize {
+            let err = tokio::time::timeout(
+                Duration::from_secs(3),
+                backend.validate_cache_time_column(pool.as_ref()),
+            )
+            .await
+            .expect("validate_cache_time_column must not hang on silent server")
+            .expect_err("must time out against silent server");
+            assert!(
+                matches!(err, DynamicTableBackendError::Connection(_)),
+                "timeout must classify as retriable Connection, got {err:?}"
+            );
+            assert_eq!(
+                connections.load(Ordering::SeqCst),
+                attempt,
+                "each timed-out attempt must detach its connection and open a fresh one"
+            );
+        }
+
+        let (pool2, connections2) = silent_pool().await;
+        for attempt in 1..=3usize {
+            let err = tokio::time::timeout(
+                Duration::from_secs(3),
+                PostgresDynamicTableBackendFactory::ensure_table_exists(
+                    pool2.clone(),
+                    "streamling.silent_init".to_string(),
+                    "value",
+                    Duration::from_millis(150),
+                ),
+            )
+            .await
+            .expect("ensure_table_exists must not hang on silent server")
+            .expect_err("must time out against silent server");
+            assert!(
+                matches!(err, DynamicTableBackendError::Connection(_)),
+                "timeout must classify as retriable Connection, got {err:?}"
+            );
+            assert_eq!(
+                connections2.load(Ordering::SeqCst),
+                attempt,
+                "each timed-out attempt must detach its connection and open a fresh one"
+            );
+        }
     }
 }
