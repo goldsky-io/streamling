@@ -24,7 +24,9 @@ For a normal single-consumer node, `WrappingExec` records:
 - `state="busy"`: the wrapper's own work on each delivered batch, from the
   end of the input wait to the yield (row metrics, checkpoint markers,
   event-time metrics, side outputs, live inspect). A SQL transform adds its
-  subtree compute (see below).
+  subtree compute (see below). For a task-decoupled producer that claims the
+  `TaskWaitMeter`, the meter reports `busy` instead and this work is in no
+  state (see below).
 
 Every series is a `NodeTime`. A process-wide flusher reports each open span
 every second, so a wait shows while it lasts, not as one spike when it ends.

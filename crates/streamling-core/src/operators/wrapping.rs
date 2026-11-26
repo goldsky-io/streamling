@@ -1017,6 +1017,9 @@ impl ExecutionPlan for WrappingExec {
                         // Process side outputs
                         for side_output in &side_outputs {
                             if let Err(e) = side_output.process(&batch).await {
+                                if let Some(wrapper_busy) = &wrapper_busy {
+                                    wrapper_busy.discard();
+                                }
                                 debug!("WrappingExec [{}]: Side output error, stream will terminate: {}", metric_metadata_id, e);
                                 yield Err(DataFusionError::from(crate::streamling_err!(
                                     "side output error for '{}': {e}",
@@ -2891,9 +2894,10 @@ mod tests {
         .unwrap();
         let ctx = SessionContext::new();
         let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let input_delay = Duration::from_millis(10);
         let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
             inner: source_exec,
-            per_batch_delay: Duration::from_millis(10),
+            per_batch_delay: input_delay,
         });
         let side_output_delay = Duration::from_millis(50);
         let wrapping = Arc::new(
@@ -2922,9 +2926,12 @@ mod tests {
             busy >= side_output_ms,
             "busy {busy}ms must cover the side output work {side_output_ms}ms"
         );
+        // The wait that ends in end-of-stream is teardown, never attributed;
+        // the rest of the margin is scheduling outside any span.
         let attributed = starved + busy + blocked;
+        let unattributed_limit = input_delay.as_millis() as u64 + 50;
         assert!(
-            attributed <= wall && wall - attributed < 30,
+            attributed <= wall && wall - attributed < unattributed_limit,
             "starved {starved} + busy {busy} + blocked {blocked} = {attributed}ms must cover wall {wall}ms"
         );
     }
