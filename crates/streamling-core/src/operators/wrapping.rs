@@ -890,6 +890,16 @@ impl ExecutionPlan for WrappingExec {
                     work,
                 )
             });
+        // The wrapper's own work on a batch, between its input wait and its
+        // yield. A task operator's meter holds that work in no state instead.
+        let wrapper_busy = (measures_node_time && !task_claimed).then(|| {
+            NodeTime::wall(
+                Arc::clone(&metrics_recorder),
+                &metric_metadata_id,
+                "busy",
+                "",
+            )
+        });
         // A task operator times `blocked` as its output send wait; otherwise
         // it is this wrapper's yield->resume.
         let (blocked_time, task_blocked) = if task_claimed {
@@ -939,6 +949,9 @@ impl ExecutionPlan for WrappingExec {
 
                 match batch_result {
                     Ok(batch) => {
+                        if let Some(wrapper_busy) = &wrapper_busy {
+                            wrapper_busy.open();
+                        }
                         // Our own work on the batch holds the task's send
                         // back, not the downstream: in no state.
                         if let Some(task_blocked) = &task_blocked {
@@ -1004,6 +1017,9 @@ impl ExecutionPlan for WrappingExec {
                         // Process side outputs
                         for side_output in &side_outputs {
                             if let Err(e) = side_output.process(&batch).await {
+                                if let Some(wrapper_busy) = &wrapper_busy {
+                                    wrapper_busy.discard();
+                                }
                                 debug!("WrappingExec [{}]: Side output error, stream will terminate: {}", metric_metadata_id, e);
                                 yield Err(DataFusionError::from(crate::streamling_err!(
                                     "side output error for '{}': {e}",
@@ -1017,6 +1033,9 @@ impl ExecutionPlan for WrappingExec {
 
                         if let Some(task_blocked) = &task_blocked {
                             task_blocked.resume();
+                        }
+                        if let Some(wrapper_busy) = &wrapper_busy {
+                            wrapper_busy.close();
                         }
                         // Until the downstream asks again, this node is blocked.
                         if let Some(blocked_time) = &blocked_time {
@@ -2853,6 +2872,67 @@ mod tests {
         assert!(
             starved >= 10,
             "expected starved >= 10ms for a 3×10ms slow source, got {starved}ms"
+        );
+    }
+
+    /// A node that does not claim the task meter does its own work on each
+    /// batch (telemetry, side outputs, live inspect) after its input wait
+    /// ends and before it yields: that work is `busy`, so the triad covers
+    /// the node's wall time.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wrapper_work_on_a_batch_is_busy() {
+        use crate::telemetry::recorder::test_support;
+
+        let _guard = test_support::TEST_LOCK.lock().unwrap();
+        let node_id = "wrapper_work_is_busy";
+        test_support::init_recorder_with_node(node_id);
+        let mem_table = MemTable::try_new(
+            test_schema(),
+            vec![vec![test_batch(), test_batch(), test_batch()]],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let source_exec = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let input_delay = Duration::from_millis(10);
+        let slow_input: Arc<dyn ExecutionPlan> = Arc::new(SlowInputExec {
+            inner: source_exec,
+            per_batch_delay: input_delay,
+        });
+        let side_output_delay = Duration::from_millis(50);
+        let wrapping = Arc::new(
+            WrappingExec::new(
+                slow_input,
+                node_id.to_string(),
+                vec![Arc::new(SlowSideOutput(side_output_delay))],
+                vec![],
+                None,
+            )
+            .with_downstream_id("down".to_string()),
+        );
+        let start = std::time::Instant::now();
+        let mut stream = wrapping.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+        let wall = start.elapsed().as_millis() as u64;
+        let starved = test_support::node_wait_ms(node_id, "starved", None);
+        let busy = test_support::node_wait_ms(node_id, "busy", None);
+        let blocked = test_support::node_wait_ms(node_id, "blocked", Some("down"));
+
+        let side_output_ms = 3 * side_output_delay.as_millis() as u64;
+        assert!(
+            busy >= side_output_ms,
+            "busy {busy}ms must cover the side output work {side_output_ms}ms"
+        );
+        // The wait that ends in end-of-stream is teardown, never attributed;
+        // the rest of the margin is scheduling outside any span.
+        let attributed = starved + busy + blocked;
+        let unattributed_limit = input_delay.as_millis() as u64 + 50;
+        assert!(
+            attributed <= wall && wall - attributed < unattributed_limit,
+            "starved {starved} + busy {busy} + blocked {blocked} = {attributed}ms must cover wall {wall}ms"
         );
     }
 

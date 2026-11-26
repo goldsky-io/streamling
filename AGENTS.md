@@ -174,11 +174,13 @@ Who measures each state:
 
 | Node | starved | busy |
 |------|---------|------|
-| SQL transform | `WrappingExec` input poll minus the subtree's own DataFusion compute, which runs in the `CheckpointableExec` forwarder task | that compute (`OwnWork`) |
+| SQL transform | `WrappingExec` input poll minus the subtree's own DataFusion compute, which runs in the `CheckpointableExec` forwarder task | that compute (`OwnWork`), plus the wrapper's per-batch work (below) |
 | Handler / WASM / plugin transform | `TaskWaitMeter`: the task's input await | `TaskWaitMeter`: task time outside input and send awaits |
 | Kafka / ClickHouse / file / hybrid source | `TaskWaitMeter`: broker wait, failure backoff, idle file poll | `TaskWaitMeter`: fetch and decode, and the Kafka offset commit / file progress persist on finalize |
-| Plugin source | `WrappingExec` input poll (the plugin's fetch and decode run out of process, so it is never split) | none |
+| Plugin source | `WrappingExec` input poll (the plugin's fetch and decode run out of process, so it is never split) | the wrapper's per-batch work only |
 | Sink | `WrappingDataSink` input poll | time the connector holds a batch before it asks for the next one |
+
+A `WrappingExec` that does not claim the meter times its own work on each delivered batch (row metrics, markers, side outputs, live inspect), from the end of the input wait to the yield, as `busy`. For a claiming operator that work pauses the task's send wait and is in no state.
 
 A task-decoupled operator must claim the `TaskWaitMeter` (`telemetry/task_wait.rs`) its wrapper installs in the `TaskContext`, and bracket its input waits (`next`, `wait_input`), sends (`send`), and waits on the sinks (`untimed`, in no state); otherwise its work reads as `starved`. Its send wait is the edge's `blocked`, except while the wrapper itself works on a batch (side outputs): that pause is in no state. An operator that runs inner sources one after another reserves the meter (`TaskWaitMeter::reserve`) and lets each claim it in turn. The inner sources' own `WrappingExec`s share that reserved meter and emit no `node_wait`, so a hybrid source's whole triad is under its YAML name. The hybrid driver times its normalize work (`busy`) and edge sends (`blocked`) through the `ReservedMeter` that `reserve` returns.
 

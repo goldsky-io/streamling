@@ -21,6 +21,12 @@ For a normal single-consumer node, `WrappingExec` records:
 - `state="starved"`: time spent awaiting the next input batch from upstream.
   A wait that ends in end-of-stream or an error is teardown: its unflushed
   tail is dropped (see below).
+- `state="busy"`: the wrapper's own work on each delivered batch, from the
+  end of the input wait to the yield (row metrics, checkpoint markers,
+  event-time metrics, side outputs, live inspect). A SQL transform adds its
+  subtree compute (see below). For a task-decoupled producer that claims the
+  `TaskWaitMeter`, the meter reports `busy` instead and this work is in no
+  state (see below).
 
 Every series is a `NodeTime`. A process-wide flusher reports each open span
 every second, so a wait shows while it lasts, not as one spike when it ends.
@@ -71,7 +77,7 @@ states can add up to more than its wall time.
 
 A plugin source cannot be split: the plugin fetches and decodes out of
 process, and the plugin protocol carries no wait signal. Its whole input poll
-is `starved`, and its `busy` is zero.
+is `starved`, and its `busy` is only the wrapper's per-batch work.
 
 A SQL transform's forwarder task cannot claim the meter: its input await
 drives the SQL subtree inline, so compute runs inside the await. The wrapper
@@ -129,8 +135,9 @@ than 1. The overlaps:
 
 - a hybrid source's phase and driver (see above);
 - a SQL transform's subtree compute (`busy`), which runs in its forwarder
-  task: while the wrapper is `blocked`, the forwarder keeps computing until
-  its output channel (`internal_buffer_size`, 10 by default) is full;
+  task: while the wrapper is `blocked` or works on a batch (`busy`), the
+  forwarder keeps computing until its output channel
+  (`internal_buffer_size`, 10 by default) is full;
 - a SQL transform's subtree compute that runs off its partition's task (a
   repartition inside the subtree).
 
